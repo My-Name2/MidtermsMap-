@@ -651,9 +651,9 @@ def make_district_map_figure(state_po, year, sub):
 # SIDEBAR: FILE PATHS + CONTROLS
 # ----------------------------
 st.sidebar.header("Inputs")
+default_pres = "1976-2024-president-extended.csv"
+default_house = "1976-2024-house (1).tab"
 
-default_pres = r"E:\1976-2024-president-extended.csv"
-default_house = r"E:\1976-2024-house.tab"
 
 pres_path = st.sidebar.text_input("Presidential CSV path", value=default_pres)
 house_path = st.sidebar.text_input("House TAB/CSV path", value=default_house)
