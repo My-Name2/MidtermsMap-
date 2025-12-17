@@ -1,0 +1,12 @@
+streamlit
+pandas
+numpy
+requests
+beautifulsoup4
+lxml
+plotly
+geopandas
+pyogrio
+shapely
+fiona
+pyproj
