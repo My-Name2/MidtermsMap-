@@ -10,3 +10,4 @@ pyogrio
 shapely
 fiona
 pyproj
+openpyxl
