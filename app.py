@@ -75,7 +75,9 @@ STATE_FIPS = {
 # ----------------------------
 # HELPERS
 # ----------------------------
-DIST_RE = re.compile(r"\b([A-Z]{2}-(?:AL|\d{1,2}))\b", re.I)
+# NOTE: include 00 because 270toWin sometimes uses ST-00 for at-large
+DIST_RE = re.compile(r"\b([A-Z]{2}-(?:AL|00|\d{1,2}))\b", re.I)
+
 RATING_KEYS = ["Likely Dem", "Leans Dem", "Tilt Dem", "Toss-up", "Tilt Rep", "Leans Rep", "Likely Rep"]
 
 RATING_SCORE = {
@@ -133,9 +135,21 @@ def cand_join(names):
     return " / ".join(names[:3]) if names else ""
 
 def normalize_rating_label(s):
-    s = str(s).strip().lower().replace("toss up", "toss-up")
+    """
+    Robust normalization for rating bucket labels.
+    Fixes cases where the site uses 'Toss Up', 'TossUp', 'TOSSUP', etc.
+    """
+    s = str(s).strip().lower()
     s = re.sub(r"\s+", " ", s)
-    return s.title().replace("Toss Up", "Toss-up")
+
+    # normalize toss-up variants (including dashed variants)
+    s = s.replace("toss ups", "toss-up").replace("toss up", "toss-up")
+    s = s.replace("tossups", "toss-up").replace("tossup", "toss-up")
+    s = s.replace("toss–up", "toss-up").replace("toss—up", "toss-up")
+
+    s = s.title()
+    s = s.replace("Toss-Up", "Toss-up")
+    return s
 
 def is_tossup(x):
     return normalize_rating_label(x) == "Toss-up"
@@ -214,26 +228,79 @@ def fetch_html(url, timeout=30):
 # ----------------------------
 @st.cache_data(show_spinner=False, ttl=6*60*60)
 def parse_270toWin_table_like(url):
+    """
+    Robust parser for 270toWin rating tables that correctly captures Toss-ups.
+    Why this exists: the site sometimes splits "Toss Up" across tokens/nodes,
+    so naive token-scans miss the bucket and you end up with zero Toss-ups.
+    """
     html = fetch_html(url)
     if not html:
         return {}
-    soup = BeautifulSoup(html, "html.parser")
-    tokens = [t.strip() for t in soup.get_text("\n").split("\n")]
-    tokens = [t for t in tokens if t]
 
-    current = None
+    soup = BeautifulSoup(html, "html.parser")
+
+    def canon(code: str) -> str:
+        # accept AL or 00 for at-large; return ST-AL or ST-#
+        code = (code or "").strip().upper()
+        m = re.match(r"^([A-Z]{2})-(\d{1,2}|AL|00)$", code)
+        if not m:
+            return ""
+        st, d = m.group(1), m.group(2)
+        if d in ("AL", "00"):
+            return f"{st}-AL"
+        return f"{st}-{int(d)}"
+
+    def extract_codes_from_node(node):
+        if not node:
+            return set()
+        txt = node.get_text(" ", strip=True).upper()
+        raw = set(re.findall(r"\b[A-Z]{2}-(?:\d{1,2}|AL|00)\b", txt))
+        out = set()
+        for c in raw:
+            cc = canon(c)
+            if cc:
+                out.add(cc)
+        return out
+
     out = {}
+
+    # --- Primary approach: bucket heading -> nearby table/container ---
+    heading_tags = soup.find_all(["h1", "h2", "h3", "h4", "h5", "strong", "b"])
+    for h in heading_tags:
+        ht = normalize_rating_label(h.get_text(" ", strip=True))
+        if ht not in RATING_KEYS:
+            continue
+
+        nxt_table = h.find_next("table")
+        if nxt_table:
+            for code in extract_codes_from_node(nxt_table):
+                out[code] = ht
+            continue
+
+        nxt_block = h.find_next(["div", "section", "ul", "ol"])
+        if nxt_block:
+            for code in extract_codes_from_node(nxt_block):
+                out[code] = ht
+
+    if out:
+        return out
+
+    # --- Fallback: scan full stripped_strings stream ---
+    tokens = list(soup.stripped_strings)
+    current = None
     for t in tokens:
         t_norm = normalize_rating_label(t)
-        for rk in RATING_KEYS:
-            if t_norm.startswith(rk):
-                current = rk
-                break
+        if t_norm in RATING_KEYS:
+            current = t_norm
+            continue
         if not current:
             continue
-        m = DIST_RE.search(t.upper())
-        if m:
-            out[m.group(1).upper()] = current
+
+        for raw in re.findall(r"\b[A-Z]{2}-(?:\d{1,2}|AL|00)\b", str(t).upper()):
+            code = canon(raw)
+            if code:
+                out[code] = current
+
     return out
 
 @st.cache_data(show_spinner=False, ttl=6*60*60)
@@ -282,7 +349,11 @@ def build_ratings_union_table(cook_map: dict, sabato_map: dict, inside_map: dict
 
     # handy: is any source "Toss-up" or "Tilt" (more “competitive” bucket)
     def any_competitive(row):
-        labs = [normalize_rating_label(row["Cook_2026"]), normalize_rating_label(row["Sabato_2026"]), normalize_rating_label(row["Inside_2026"])]
+        labs = [
+            normalize_rating_label(row["Cook_2026"]),
+            normalize_rating_label(row["Sabato_2026"]),
+            normalize_rating_label(row["Inside_2026"])
+        ]
         return int(any(l in ("Toss-up", "Tilt Dem", "Tilt Rep") for l in labs if l))
 
     df["any_tossup_or_tilt"] = df.apply(any_competitive, axis=1)
@@ -349,7 +420,7 @@ def load_inputs(pres_path, house_path):
     pres_df["year"] = pd.to_numeric(pres_df.get("year", pd.Series(dtype="object")), errors="coerce")
     pres_df["party_simplified"] = pres_df.get("party_simplified", "").astype(str).str.strip().str.upper()
     pres_df["state_po"] = pres_df.get("state_po", "").astype(str).str.strip().str.upper()
-    pres_df["candidatevotes"] = pd.to_numeric(pres_df.get("candidatevotes", pd.Series(dtype="object")), errors="coerce")
+    pres_df["candidatevotes"] = pd.to_numeric(pres_df.get("candidatevotes", pd.Series(dtype="object")), errors="coerce)
 
     pres_cand_col = "candidate" if "candidate" in pres_df.columns else None
     if pres_cand_col:
@@ -485,12 +556,14 @@ def compute_pres_state_results(pres_df, pres_cand_col, year):
     for c in ["pres_dem_pct_all","pres_rep_pct_all","pres_margin"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    return out[[
-        "state_po","pres_margin",
-        "pres_dem_candidate","pres_rep_candidate",
-        "pres_dem_votes","pres_rep_votes","pres_total_votes_all",
-        "pres_dem_pct_all","pres_rep_pct_all"
-    ]]
+    return out[
+        [
+            "state_po","pres_margin",
+            "pres_dem_candidate","pres_rep_candidate",
+            "pres_dem_votes","pres_rep_votes","pres_total_votes_all",
+            "pres_dem_pct_all","pres_rep_pct_all"
+        ]
+    ]
 
 def compute_house_district_results(house_df, year):
     df = house_df[
@@ -541,13 +614,15 @@ def compute_house_district_results(house_df, year):
     for c in ["dem_pct_all","rep_pct_all","house_margin"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    return out[[
-        "state_po","district","district_id",
-        "dem_candidate","rep_candidate",
-        "dem_votes","rep_votes","total_votes_all",
-        "dem_pct_all","rep_pct_all",
-        "house_margin"
-    ]]
+    return out[
+        [
+            "state_po","district","district_id",
+            "dem_candidate","rep_candidate",
+            "dem_votes","rep_votes","total_votes_all",
+            "dem_pct_all","rep_pct_all",
+            "house_margin"
+        ]
+    ]
 
 def compute_house_state_avg(house_df, year):
     ddf = compute_house_district_results(house_df, year)
@@ -650,7 +725,6 @@ def build_year_data(pres_path, house_path, spend_xlsx_path):
         # merge spending into districts (cycle_year == y)
         if not spend_dist.empty:
             sd = spend_dist[spend_dist["cycle_year"] == y].copy()
-            # drop keys already implied by district_id (keep cycle_year optional)
             sd = sd.drop(columns=["cycle_year", "state_po"], errors="ignore")
             dist_year = dist_year.merge(sd, on="district_id", how="left")
 
@@ -674,7 +748,6 @@ def build_year_data(pres_path, house_path, spend_xlsx_path):
             sdf["pres_margin_str"] = sdf.get("pres_margin", np.nan).map(fmt_pct)
             sdf["avg_house_margin_str"] = sdf.get("avg_house_margin", np.nan).map(fmt_pct)
 
-            # ensure FEC cols exist
             for col in [
                 "fec_disburse_democrat","fec_disburse_republican","fec_disburse_all","fec_disburse_margin",
                 "fec_receipts_democrat","fec_receipts_republican","fec_receipts_all","fec_receipts_margin",
@@ -821,15 +894,17 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str):
     sub["fec_sp_margin_str"] = sub[mar_sp].map(fmt_pct)
 
     m = gdf[["district_id"]].merge(
-        sub[[
-            "district_id",
-            "house_margin",
-            "dem_candidate","rep_candidate",
-            "dem_votes_str","rep_votes_str","total_votes_str",
-            "dem_pct_all_str","rep_pct_all_str",
-            "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
-            "fec_dem_sp_str","fec_rep_sp_str","fec_all_sp_str","fec_sp_margin_str"
-        ]],
+        sub[
+            [
+                "district_id",
+                "house_margin",
+                "dem_candidate","rep_candidate",
+                "dem_votes_str","rep_votes_str","total_votes_str",
+                "dem_pct_all_str","rep_pct_all_str",
+                "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
+                "fec_dem_sp_str","fec_rep_sp_str","fec_all_sp_str","fec_sp_margin_str"
+            ]
+        ],
         on="district_id", how="left"
     )
 
@@ -1027,15 +1102,17 @@ for c in [dem_sp, rep_sp, all_sp, mar_sp]:
     if c not in sub.columns:
         sub[c] = np.nan
 
-show = sub[[
-    "district_id",
-    "dem_candidate","dem_votes","dem_pct_all",
-    "rep_candidate","rep_votes","rep_pct_all",
-    "total_votes_all",
-    "house_margin",
-    "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
-    dem_sp, rep_sp, all_sp, mar_sp
-]].copy()
+show = sub[
+    [
+        "district_id",
+        "dem_candidate","dem_votes","dem_pct_all",
+        "rep_candidate","rep_votes","rep_pct_all",
+        "total_votes_all",
+        "house_margin",
+        "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
+        dem_sp, rep_sp, all_sp, mar_sp
+    ]
+].copy()
 
 show["dem_votes"] = show["dem_votes"].map(fmt_int)
 show["rep_votes"] = show["rep_votes"].map(fmt_int)
@@ -1093,15 +1170,16 @@ else:
     context = year_data[year]["dist_df"].copy()
 
     merged = ratings_union.merge(
-        context[[
-            "district_id",
-            "dem_candidate","rep_candidate",
-            "dem_votes","rep_votes","total_votes_all",
-            "dem_pct_all","rep_pct_all","house_margin",
-            "tossup_agree_count",
-            # FEC fields if present in the context for this year
-            *[c for c in context.columns if c.startswith("fec_")]
-        ]],
+        context[
+            [
+                "district_id",
+                "dem_candidate","rep_candidate",
+                "dem_votes","rep_votes","total_votes_all",
+                "dem_pct_all","rep_pct_all","house_margin",
+                "tossup_agree_count",
+                *[c for c in context.columns if c.startswith("fec_")]
+            ]
+        ],
         on="district_id",
         how="left"
     )
