@@ -420,7 +420,10 @@ def load_inputs(pres_path, house_path):
     pres_df["year"] = pd.to_numeric(pres_df.get("year", pd.Series(dtype="object")), errors="coerce")
     pres_df["party_simplified"] = pres_df.get("party_simplified", "").astype(str).str.strip().str.upper()
     pres_df["state_po"] = pres_df.get("state_po", "").astype(str).str.strip().str.upper()
-    pres_df["candidatevotes"] = pd.to_numeric(pres_df.get("candidatevotes", pd.Series(dtype="object")), errors="coerce)
+    pres_df["candidatevotes"] = pd.to_numeric(
+        pres_df.get("candidatevotes", pd.Series(dtype="object")),
+        errors="coerce"
+    )
 
     pres_cand_col = "candidate" if "candidate" in pres_df.columns else None
     if pres_cand_col:
@@ -434,6 +437,7 @@ def load_inputs(pres_path, house_path):
     house_df["candidatevotes"] = pd.to_numeric(house_df.get("candidatevotes", pd.Series(dtype="object")), errors="coerce")
 
     return pres_df, pres_cand_col, house_df
+
 
 # ----------------------------
 # LOAD FEC SPENDING (EXCEL)
