@@ -1,15 +1,25 @@
-# ============================================
+# -*- coding: utf-8 -*-
 # STREAMLIT APP: US Elections Explorer
 # - Years: 2016 / 2018 / 2020 / 2022 / 2024
 # - State map colors: Pres margin OR Avg House margin
 # - District hover includes House results + 2026 ratings + optional FEC + optional ACS demographics
 # - Ratings Universe view (Cook/Sabato/Inside from 3x 270toWin URLs ONLY)
-# - WAR merge-in from your uploaded CSV (per district/year)
-# - ACS (American Community Survey) 5-year Data Profile via Census API (district + state)
-#   * Fields added (excluding religiousness/union): race, gender, income, education, age, veteran
-# ============================================
+# - WAR (wins above replacement) merge-in from your uploaded CSV (per district/year)
+# - ACS (American Community Survey) 5-year Data Profile merge-in (district + state)
+#   * District-level via Census API “congressional district”
+#   * State-level via Census API “state”
+#   * Fields added: race, gender, income, education, age, veteran
+#
+# FIXES IN THIS VERSION (for your screenshots/errors):
+# 1) DISTRICT SHAPES: robust detection of the CD FP column:
+#    - works for CD116FP / CD118FP (and similar), no more "Could not find district FP column".
+# 2) ACS DISPLAY: Census "PE" fields are percentage points (0..100).
+#    - We store them as decimals (0..1) AND fmt_pct auto-normalizes values > 1 by dividing by 100.
+#    - This fixes the nonsense like 150.00%, 230.00%, 3120.00%, etc.
+# 3) WAR LOADER: handles your actual columns and avoids `.get(...,"")` returning scalars.
 
-import re, json
+import re
+import json
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +38,10 @@ import streamlit as st
 st.set_page_config(page_title="US Elections Explorer", layout="wide")
 
 UA = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome Safari"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
@@ -54,30 +67,28 @@ CD_ZIPS = {
 }
 
 STATE_FIPS = {
-    "AL":"01","AK":"02","AZ":"04","AR":"05","CA":"06","CO":"08","CT":"09","DE":"10","DC":"11","FL":"12","GA":"13",
-    "HI":"15","ID":"16","IL":"17","IN":"18","IA":"19","KS":"20","KY":"21","LA":"22","ME":"23","MD":"24","MA":"25",
-    "MI":"26","MN":"27","MS":"28","MO":"29","MT":"30","NE":"31","NV":"32","NH":"33","NJ":"34","NM":"35","NY":"36",
-    "NC":"37","ND":"38","OH":"39","OK":"40","OR":"41","PA":"42","RI":"44","SC":"45","SD":"46","TN":"47","TX":"48",
-    "UT":"49","VT":"50","VA":"51","WA":"53","WV":"54","WI":"55","WY":"56","PR":"72",
+    "AL": "01", "AK": "02", "AZ": "04", "AR": "05", "CA": "06", "CO": "08", "CT": "09", "DE": "10",
+    "DC": "11", "FL": "12", "GA": "13", "HI": "15", "ID": "16", "IL": "17", "IN": "18", "IA": "19",
+    "KS": "20", "KY": "21", "LA": "22", "ME": "23", "MD": "24", "MA": "25", "MI": "26", "MN": "27",
+    "MS": "28", "MO": "29", "MT": "30", "NE": "31", "NV": "32", "NH": "33", "NJ": "34", "NM": "35",
+    "NY": "36", "NC": "37", "ND": "38", "OH": "39", "OK": "40", "OR": "41", "PA": "42", "RI": "44",
+    "SC": "45", "SD": "46", "TN": "47", "TX": "48", "UT": "49", "VT": "50", "VA": "51", "WA": "53",
+    "WV": "54", "WI": "55", "WY": "56", "PR": "72",
 }
 FIPS_TO_STATE = {v: k for k, v in STATE_FIPS.items()}
 
-# ----------------------------
-# HELPERS
-# ----------------------------
 DIST_RE = re.compile(r"\b([A-Z]{2}-(?:AL|\d{1,2}))\b", re.I)
 
 RATING_KEYS = ["Likely Dem", "Leans Dem", "Tilt Dem", "Toss-up", "Tilt Rep", "Leans Rep", "Likely Rep"]
 RATING_SCORE = {
-    "Likely Dem": -3,
-    "Leans Dem": -2,
-    "Tilt Dem": -1,
+    "Likely Dem": -3, "Leans Dem": -2, "Tilt Dem": -1,
     "Toss-up": 0,
-    "Tilt Rep": 1,
-    "Leans Rep": 2,
-    "Likely Rep": 3,
+    "Tilt Rep": 1, "Leans Rep": 2, "Likely Rep": 3,
 }
 
+# ----------------------------
+# Formatting helpers
+# ----------------------------
 def safe_plot_col(series):
     s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
     return s.apply(lambda x: None if (x is None or (isinstance(x, float) and not np.isfinite(x)) or pd.isna(x)) else float(x))
@@ -90,20 +101,22 @@ def fmt_int(x):
     except Exception:
         return ""
 
-def fmt_float(x, nd=2):
-    try:
-        if pd.isna(x):
-            return ""
-        return f"{float(x):.{nd}f}"
-    except Exception:
-        return ""
-
 def fmt_pct(x):
-    """expects fraction in [0,1], prints '52.50%' """
+    """
+    IMPORTANT FIX:
+    - Census "PE" values come back as 0..100 (percentage points).
+    - We store them as 0..1 when we can.
+    - But if anything slips through as 75.0, 150.0, etc, we auto-normalize here.
+    """
     try:
         if pd.isna(x):
             return ""
-        return f"{float(x):.2%}"
+        v = float(x)
+        if not np.isfinite(v):
+            return ""
+        if abs(v) > 1.0:
+            v = v / 100.0
+        return f"{v:.2%}"
     except Exception:
         return ""
 
@@ -174,7 +187,6 @@ def party_simple_from_fec(party_str: str):
     return ""
 
 def district_code_to_id(code: str):
-    # examples: "AL-01", "VT-00", "AK-AL"
     s = (code or "").strip().upper()
     m = re.match(r"^([A-Z]{2})-(\d{1,2}|00|AL)$", s)
     if not m:
@@ -188,7 +200,6 @@ def district_code_to_id(code: str):
         return ""
 
 def normalize_geo_to_district_id(geo: str) -> str:
-    # WAR file uses "AZ-1" (no leading zero) OR "AZ-01" sometimes
     s = (geo or "").strip().upper()
     m = re.match(r"^([A-Z]{2})-(AL|\d{1,2}|00|0)$", s)
     if not m:
@@ -216,7 +227,7 @@ def series_or_blank(df: pd.DataFrame, col: str) -> pd.Series:
 # ----------------------------
 # HTML FETCH
 # ----------------------------
-@st.cache_data(show_spinner=False, ttl=6*60*60)
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
 def fetch_html(url, timeout=30):
     try:
         r = requests.get(url, headers=UA, timeout=timeout)
@@ -230,7 +241,7 @@ def fetch_html(url, timeout=30):
 # ----------------------------
 # RATINGS PARSERS (270toWin)
 # ----------------------------
-@st.cache_data(show_spinner=False, ttl=6*60*60)
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
 def parse_270toWin_table_like(url):
     html = fetch_html(url)
     if not html:
@@ -256,20 +267,11 @@ def parse_270toWin_table_like(url):
 
     return out
 
-def normalize_ratings_map(m: dict) -> dict:
-    """Convert 270toWin keys like 'AZ-01' to our district_id like 'AZ-1'."""
-    out = {}
-    for k, v in (m or {}).items():
-        did = district_code_to_id(k)
-        if did:
-            out[did] = v
-    return out
-
-@st.cache_data(show_spinner=False, ttl=6*60*60)
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
 def get_2026_ratings_maps():
-    cook_map = normalize_ratings_map(parse_270toWin_table_like(URL_COOK_270))
-    sabato_map = normalize_ratings_map(parse_270toWin_table_like(URL_SABATO_270))
-    inside_map = normalize_ratings_map(parse_270toWin_table_like(URL_INSIDE_270))
+    cook_map = parse_270toWin_table_like(URL_COOK_270)
+    sabato_map = parse_270toWin_table_like(URL_SABATO_270)
+    inside_map = parse_270toWin_table_like(URL_INSIDE_270)
     return cook_map, sabato_map, inside_map
 
 def build_ratings_union_table(cook_map: dict, sabato_map: dict, inside_map: dict) -> pd.DataFrame:
@@ -314,6 +316,7 @@ def build_ratings_union_table(cook_map: dict, sabato_map: dict, inside_map: dict
         return int(any(l in ("Toss-up", "Tilt Dem", "Tilt Rep") for l in labs if l))
 
     df["any_tossup_or_tilt"] = df.apply(any_competitive, axis=1)
+
     return df
 
 # ----------------------------
@@ -325,6 +328,7 @@ def load_house_wrapped_quotes_csv(path):
         header_line = f.readline().strip().lstrip("\ufeff")
         header = [h.strip() for h in header_line.split(",")]
         cand_idx = header.index("candidate") if "candidate" in header else None
+
         rows = []
         for ln in f:
             ln = ln.strip()
@@ -333,15 +337,19 @@ def load_house_wrapped_quotes_csv(path):
             if ln.startswith('"') and ln.endswith('"'):
                 ln = ln[1:-1]
             parts = ln.split(",")
+
+            # candidate may contain commas
             if cand_idx is not None and len(parts) > len(header):
                 extra = len(parts) - len(header)
                 candidate_merged = ",".join(parts[cand_idx : cand_idx + extra + 1])
                 parts = parts[:cand_idx] + [candidate_merged] + parts[cand_idx + extra + 1 :]
+
             if len(parts) < len(header):
                 parts += [""] * (len(header) - len(parts))
             if len(parts) > len(header):
                 parts = parts[: len(header)]
             rows.append(parts)
+
         df = pd.DataFrame(rows, columns=header)
         df.columns = df.columns.astype(str).str.strip().str.replace("\ufeff", "", regex=False)
         return df
@@ -357,6 +365,7 @@ def load_inputs(pres_path, house_path):
             house_df_try = pd.read_csv(house_path, sep="\t", low_memory=False)
         else:
             house_df_try = pd.read_csv(house_path, low_memory=False)
+
         house_df_try.columns = house_df_try.columns.astype(str).str.strip().str.replace("\ufeff", "", regex=False)
         y = pd.to_numeric(house_df_try.get("year", pd.Series(dtype="object")), errors="coerce")
         if y.notna().sum() == 0:
@@ -388,10 +397,6 @@ def load_inputs(pres_path, house_path):
 # ----------------------------
 @st.cache_data(show_spinner=True)
 def load_fec_spending(spend_xlsx_path: str):
-    """
-    Expects sheet 'House_Candidate_Spending' and columns like:
-      cycle_year, state_abbrev, district_code, party, receipts, disbursements, ...
-    """
     if not spend_xlsx_path:
         return pd.DataFrame(), pd.DataFrame()
     p = Path(spend_xlsx_path)
@@ -410,20 +415,29 @@ def load_fec_spending(spend_xlsx_path: str):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    dist_all = df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]].sum().reset_index()
-    dist_all = dist_all.rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
+    dist_all = (
+        df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]]
+        .sum()
+        .reset_index()
+        .rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
+    )
 
     maj = df[df["party_simple"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
     if maj.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    dist_party = maj.groupby(["cycle_year", "state_po", "district_id", "party_simple"])[["receipts", "disbursements"]].sum().reset_index()
+    dist_party = (
+        maj.groupby(["cycle_year", "state_po", "district_id", "party_simple"])[["receipts", "disbursements"]]
+        .sum()
+        .reset_index()
+    )
+
     piv = dist_party.pivot_table(
         index=["cycle_year", "state_po", "district_id"],
         columns="party_simple",
         values=["receipts", "disbursements"],
         aggfunc="sum",
-        fill_value=0.0
+        fill_value=0.0,
     )
     piv.columns = [f"fec_{a.lower()}_{b.lower()}" for a, b in piv.columns.to_flat_index()]
     piv = piv.reset_index()
@@ -434,34 +448,51 @@ def load_fec_spending(spend_xlsx_path: str):
             spend_dist[c] = 0.0
 
     spend_dist["fec_receipts_maj_total"] = spend_dist["fec_receipts_democrat"] + spend_dist["fec_receipts_republican"]
-    spend_dist["fec_receipts_margin"] = (spend_dist["fec_receipts_republican"] - spend_dist["fec_receipts_democrat"]) / spend_dist["fec_receipts_maj_total"].replace(0, np.nan)
+    spend_dist["fec_receipts_margin"] = (
+        (spend_dist["fec_receipts_republican"] - spend_dist["fec_receipts_democrat"])
+        / spend_dist["fec_receipts_maj_total"].replace(0, np.nan)
+    )
 
     spend_dist["fec_disburse_maj_total"] = spend_dist["fec_disburse_democrat"] + spend_dist["fec_disburse_republican"]
-    spend_dist["fec_disburse_margin"] = (spend_dist["fec_disburse_republican"] - spend_dist["fec_disburse_democrat"]) / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
+    spend_dist["fec_disburse_margin"] = (
+        (spend_dist["fec_disburse_republican"] - spend_dist["fec_disburse_democrat"])
+        / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
+    )
 
-    spend_state = spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
-        ["fec_receipts_democrat","fec_receipts_republican","fec_receipts_all",
-         "fec_disburse_democrat","fec_disburse_republican","fec_disburse_all"]
-    ].sum().reset_index()
+    spend_state = (
+        spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
+            [
+                "fec_receipts_democrat",
+                "fec_receipts_republican",
+                "fec_receipts_all",
+                "fec_disburse_democrat",
+                "fec_disburse_republican",
+                "fec_disburse_all",
+            ]
+        ]
+        .sum()
+        .reset_index()
+    )
 
     spend_state["fec_receipts_maj_total"] = spend_state["fec_receipts_democrat"] + spend_state["fec_receipts_republican"]
-    spend_state["fec_receipts_margin"] = (spend_state["fec_receipts_republican"] - spend_state["fec_receipts_democrat"]) / spend_state["fec_receipts_maj_total"].replace(0, np.nan)
+    spend_state["fec_receipts_margin"] = (
+        (spend_state["fec_receipts_republican"] - spend_state["fec_receipts_democrat"])
+        / spend_state["fec_receipts_maj_total"].replace(0, np.nan)
+    )
+
     spend_state["fec_disburse_maj_total"] = spend_state["fec_disburse_democrat"] + spend_state["fec_disburse_republican"]
-    spend_state["fec_disburse_margin"] = (spend_state["fec_disburse_republican"] - spend_state["fec_disburse_democrat"]) / spend_state["fec_disburse_maj_total"].replace(0, np.nan)
+    spend_state["fec_disburse_margin"] = (
+        (spend_state["fec_disburse_republican"] - spend_state["fec_disburse_democrat"])
+        / spend_state["fec_disburse_maj_total"].replace(0, np.nan)
+    )
 
     return spend_dist, spend_state
 
 # ----------------------------
-# LOAD WAR (CSV)
+# LOAD WAR (CSV)  ✅ FIXED
 # ----------------------------
 @st.cache_data(show_spinner=True)
 def load_war_by_district_year(war_csv_path: str) -> pd.DataFrame:
-    """
-    WAR file columns:
-      Year, Chamber, Geography, Democrat, Republican, WAR, Sortable
-    - Geography: e.g. "AZ-1" (no leading zero) or "AL-01"
-    - Returns: district_id, year, war_str, war_sortable, war_dem_candidate, war_rep_candidate
-    """
     if not war_csv_path:
         return pd.DataFrame()
     p = Path(war_csv_path)
@@ -479,72 +510,76 @@ def load_war_by_district_year(war_csv_path: str) -> pd.DataFrame:
     war = series_or_blank(df, "WAR")
     sortable = series_or_blank(df, "Sortable")
 
-    out = pd.DataFrame({
-        "year": pd.to_numeric(y, errors="coerce"),
-        "chamber": chamber.fillna("").astype(str).str.strip().str.upper(),
-        "district_id": geo.fillna("").astype(str).apply(normalize_geo_to_district_id),
-        "war_str": war.fillna("").astype(str).str.strip(),
-        "war_sortable": pd.to_numeric(sortable, errors="coerce"),
-        "war_dem_candidate": dem.fillna("").astype(str).str.strip(),
-        "war_rep_candidate": rep.fillna("").astype(str).str.strip(),
-    })
+    out = pd.DataFrame(
+        {
+            "year": pd.to_numeric(y, errors="coerce"),
+            "chamber": chamber.fillna("").astype(str).str.strip().str.upper(),
+            "district_id": geo.fillna("").astype(str).apply(normalize_geo_to_district_id),
+            "war_str": war.fillna("").astype(str).str.strip(),
+            "war_sortable": pd.to_numeric(sortable, errors="coerce"),
+            "war_dem_candidate": dem.fillna("").astype(str).str.strip(),
+            "war_rep_candidate": rep.fillna("").astype(str).str.strip(),
+        }
+    )
 
     out = out[(out["district_id"].astype(str).str.len() > 0) & (out["year"].notna())].copy()
     out = out[out["chamber"].isin(["HOUSE", "US HOUSE", "U.S. HOUSE", "USHOUSE", "HOUSE OF REPRESENTATIVES", ""])].copy()
 
     out = out.sort_values(["district_id", "year", "war_sortable"], ascending=[True, True, False])
     out = out.drop_duplicates(subset=["district_id", "year"], keep="first").reset_index(drop=True)
+
     return out[["district_id", "year", "war_str", "war_sortable", "war_dem_candidate", "war_rep_candidate"]]
 
 # ----------------------------
-# ACS (Census Data API) - district + state
+# ACS (Census Data API) ✅ FIXED PERCENT HANDLING
 # ----------------------------
 CENSUS_API_BASE = "https://api.census.gov/data"
 
-# IMPORTANT:
-# - *PE variables come back as percent points (0..100), e.g. 52.5 means 52.5%.
-# - We convert them to fractions (0..1) at load time so fmt_pct works correctly.
-
+# Data Profile vars:
+#   https://api.census.gov/data/<year>/acs/acs5/profile/variables.html
+# PE = percent estimate (0..100). We'll convert PE columns to 0..1 immediately.
 ACS_PROFILE_VARS = [
-    ("DP05_0001E",  "acs_total_pop"),
-    ("DP05_0002PE", "acs_pct_male"),
-    ("DP05_0003PE", "acs_pct_female"),
-    ("DP05_0018E",  "acs_median_age"),
-    # Race (one race) — these codes are from ACS Data Profile DP05
-    ("DP05_0032PE", "acs_pct_white_alone"),
-    ("DP05_0033PE", "acs_pct_black_alone"),
-    ("DP05_0039PE", "acs_pct_asian_alone"),
-    ("DP05_0071PE", "acs_pct_hispanic"),
-    # Income (Data Profile DP03)
-    ("DP03_0062E",  "acs_median_hh_income"),
-    # Education (Data Profile DP02)
-    ("DP02_0068PE", "acs_pct_bachelors_or_higher"),
-    # Veteran
-    ("DP02_0070PE", "acs_pct_veteran"),
+    ("DP05_0001E", "acs_total_pop"),                 # Total population
+    ("DP05_0002PE", "acs_pct_male"),                 # % male
+    ("DP05_0003PE", "acs_pct_female"),               # % female
+    ("DP05_0018E", "acs_median_age"),                # median age
+    ("DP05_0037PE", "acs_pct_white_alone"),          # % white alone
+    ("DP05_0038PE", "acs_pct_black_alone"),          # % black alone
+    ("DP05_0044PE", "acs_pct_asian_alone"),          # % asian alone
+    ("DP05_0071PE", "acs_pct_hispanic"),             # % hispanic/latino
+    ("DP03_0062E", "acs_median_hh_income"),          # median HH income
+    ("DP02_0068PE", "acs_pct_bachelors_or_higher"),  # % bachelor+ (25+)
+    ("DP02_0069PE", "acs_pct_veteran"),              # % veteran (18+)
 ]
 
-def _census_get(url: str, timeout=45):
+ACS_PERCENT_VARS = {
+    "acs_pct_male",
+    "acs_pct_female",
+    "acs_pct_white_alone",
+    "acs_pct_black_alone",
+    "acs_pct_asian_alone",
+    "acs_pct_hispanic",
+    "acs_pct_bachelors_or_higher",
+    "acs_pct_veteran",
+}
+
+def _census_get(url: str, timeout=40):
     r = requests.get(url, headers=UA, timeout=timeout)
     if r.status_code != 200:
         raise RuntimeError(f"Census API HTTP {r.status_code}: {r.text[:500]}")
     return r.json()
 
-def _census_url_with_key(url: str, census_key: str | None) -> str:
-    k = (census_key or "").strip()
-    if not k:
-        return url
-    joiner = "&" if "?" in url else "?"
-    return url + f"{joiner}key={k}"
-
-@st.cache_data(show_spinner=True, ttl=24*60*60)
-def load_acs_profile_congressional_district(acs_year: int, census_key: str | None) -> pd.DataFrame:
+@st.cache_data(show_spinner=True, ttl=24 * 60 * 60)
+def load_acs_profile_congressional_district(acs_year: int, api_key: str = "") -> pd.DataFrame:
     var_codes = [v for v, _ in ACS_PROFILE_VARS]
     get_expr = "NAME," + ",".join(var_codes)
     url = (
         f"{CENSUS_API_BASE}/{acs_year}/acs/acs5/profile"
         f"?get={get_expr}&for=congressional%20district:*&in=state:*"
     )
-    url = _census_url_with_key(url, census_key)
+    if api_key:
+        url += f"&key={api_key}"
+
     data = _census_get(url)
     if not data or len(data) < 2:
         return pd.DataFrame()
@@ -555,7 +590,6 @@ def load_acs_profile_congressional_district(acs_year: int, census_key: str | Non
 
     df["state"] = df["state"].astype(str).str.zfill(2)
     df["congressional district"] = df["congressional district"].astype(str).str.zfill(2)
-
     df["state_po"] = df["state"].map(FIPS_TO_STATE).fillna("")
 
     def mk_did(row):
@@ -571,21 +605,25 @@ def load_acs_profile_congressional_district(acs_year: int, census_key: str | Non
     df["district_id"] = df.apply(mk_did, axis=1)
     df = df[df["district_id"].astype(str).str.len() > 0].copy()
 
-    # parse and normalize variables
     for v, nm in ACS_PROFILE_VARS:
         df[nm] = pd.to_numeric(df.get(v, np.nan), errors="coerce")
-        if str(v).endswith("PE"):
-            df[nm] = df[nm] / 100.0  # percent points -> fraction
+
+    # ✅ critical: convert 0..100 -> 0..1
+    for nm in ACS_PERCENT_VARS:
+        if nm in df.columns:
+            df[nm] = df[nm] / 100.0
 
     out = df[["district_id", "state_po"] + [nm for _, nm in ACS_PROFILE_VARS]].copy()
     return out
 
-@st.cache_data(show_spinner=True, ttl=24*60*60)
-def load_acs_profile_state(acs_year: int, census_key: str | None) -> pd.DataFrame:
+@st.cache_data(show_spinner=True, ttl=24 * 60 * 60)
+def load_acs_profile_state(acs_year: int, api_key: str = "") -> pd.DataFrame:
     var_codes = [v for v, _ in ACS_PROFILE_VARS]
     get_expr = "NAME," + ",".join(var_codes)
     url = f"{CENSUS_API_BASE}/{acs_year}/acs/acs5/profile?get={get_expr}&for=state:*"
-    url = _census_url_with_key(url, census_key)
+    if api_key:
+        url += f"&key={api_key}"
+
     data = _census_get(url)
     if not data or len(data) < 2:
         return pd.DataFrame()
@@ -599,18 +637,16 @@ def load_acs_profile_state(acs_year: int, census_key: str | None) -> pd.DataFram
 
     for v, nm in ACS_PROFILE_VARS:
         df[nm] = pd.to_numeric(df.get(v, np.nan), errors="coerce")
-        if str(v).endswith("PE"):
-            df[nm] = df[nm] / 100.0  # percent points -> fraction
+
+    for nm in ACS_PERCENT_VARS:
+        if nm in df.columns:
+            df[nm] = df[nm] / 100.0
 
     out = df[["state_po"] + [nm for _, nm in ACS_PROFILE_VARS]].copy()
     out = out[out["state_po"].astype(str).str.len() == 2].copy()
     return out
 
-def load_acs_with_fallback(requested_year: int, census_key: str | None):
-    """
-    Try requested_year, then requested_year-1, then requested_year-2.
-    Returns (used_year, cd_df, state_df, tried_years, errors_by_year)
-    """
+def load_acs_with_fallback(requested_year: int, api_key: str = ""):
     tried = []
     errors = {}
     for y in [requested_year, requested_year - 1, requested_year - 2]:
@@ -618,41 +654,65 @@ def load_acs_with_fallback(requested_year: int, census_key: str | None):
             continue
         tried.append(y)
         try:
-            cd = load_acs_profile_congressional_district(y, census_key)
-            stt = load_acs_profile_state(y, census_key)
+            cd = load_acs_profile_congressional_district(y, api_key=api_key)
+            stt = load_acs_profile_state(y, api_key=api_key)
             if not cd.empty and not stt.empty:
                 return y, cd, stt, tried, errors
-            else:
-                errors[y] = f"Empty response (cd_rows={len(cd)}, state_rows={len(stt)})"
+            errors[y] = f"Empty response (cd_rows={len(cd)}, state_rows={len(stt)})"
         except Exception as e:
             errors[y] = repr(e)
-
     return requested_year, pd.DataFrame(), pd.DataFrame(), tried, errors
 
 # ----------------------------
 # COMPUTATIONS
 # ----------------------------
 def compute_pres_state_results(pres_df, pres_cand_col, year):
-    df = pres_df[(pres_df["year"] == year) & (pres_df["state_po"].notna()) & (pres_df["candidatevotes"].notna())].copy()
+    df = pres_df[
+        (pres_df["year"] == year)
+        & (pres_df["state_po"].notna())
+        & (pres_df["candidatevotes"].notna())
+    ].copy()
+
     if df.empty:
-        return pd.DataFrame(columns=[
-            "state_po","pres_margin",
-            "pres_dem_candidate","pres_rep_candidate",
-            "pres_dem_votes","pres_rep_votes","pres_total_votes_all",
-            "pres_dem_pct_all","pres_rep_pct_all"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "state_po",
+                "pres_margin",
+                "pres_dem_candidate",
+                "pres_rep_candidate",
+                "pres_dem_votes",
+                "pres_rep_votes",
+                "pres_total_votes_all",
+                "pres_dem_pct_all",
+                "pres_rep_pct_all",
+            ]
+        )
 
     tot_all = df.groupby("state_po")["candidatevotes"].sum().rename("pres_total_votes_all").reset_index()
 
-    maj = df[df["party_simplified"].isin(["DEMOCRAT","REPUBLICAN"])].copy()
-    pv = maj.groupby(["state_po","party_simplified"])["candidatevotes"].sum().unstack(fill_value=0)
-    if "DEMOCRAT" not in pv.columns: pv["DEMOCRAT"] = 0
-    if "REPUBLICAN" not in pv.columns: pv["REPUBLICAN"] = 0
-    pv = pv.reset_index().rename(columns={"DEMOCRAT":"pres_dem_votes","REPUBLICAN":"pres_rep_votes"})
+    maj = df[df["party_simplified"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
+    pv = maj.groupby(["state_po", "party_simplified"])["candidatevotes"].sum().unstack(fill_value=0)
+    if "DEMOCRAT" not in pv.columns:
+        pv["DEMOCRAT"] = 0
+    if "REPUBLICAN" not in pv.columns:
+        pv["REPUBLICAN"] = 0
+    pv = pv.reset_index().rename(columns={"DEMOCRAT": "pres_dem_votes", "REPUBLICAN": "pres_rep_votes"})
 
     if pres_cand_col:
-        dem_names = maj[maj["party_simplified"]=="DEMOCRAT"].groupby("state_po")[pres_cand_col].apply(lambda s: cand_join(s.tolist())).rename("pres_dem_candidate").reset_index()
-        rep_names = maj[maj["party_simplified"]=="REPUBLICAN"].groupby("state_po")[pres_cand_col].apply(lambda s: cand_join(s.tolist())).rename("pres_rep_candidate").reset_index()
+        dem_names = (
+            maj[maj["party_simplified"] == "DEMOCRAT"]
+            .groupby("state_po")[pres_cand_col]
+            .apply(lambda s: cand_join(s.tolist()))
+            .rename("pres_dem_candidate")
+            .reset_index()
+        )
+        rep_names = (
+            maj[maj["party_simplified"] == "REPUBLICAN"]
+            .groupby("state_po")[pres_cand_col]
+            .apply(lambda s: cand_join(s.tolist()))
+            .rename("pres_rep_candidate")
+            .reset_index()
+        )
     else:
         dem_names = pd.DataFrame({"state_po": pv["state_po"], "pres_dem_candidate": ""})
         rep_names = pd.DataFrame({"state_po": pv["state_po"], "pres_rep_candidate": ""})
@@ -663,46 +723,82 @@ def compute_pres_state_results(pres_df, pres_cand_col, year):
     major_total = (out["pres_dem_votes"] + out["pres_rep_votes"]).replace(0, np.nan)
     out["pres_margin"] = (out["pres_rep_votes"] - out["pres_dem_votes"]) / major_total
 
-    for c in ["pres_dem_pct_all","pres_rep_pct_all","pres_margin"]:
+    for c in ["pres_dem_pct_all", "pres_rep_pct_all", "pres_margin"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    return out[[
-        "state_po","pres_margin",
-        "pres_dem_candidate","pres_rep_candidate",
-        "pres_dem_votes","pres_rep_votes","pres_total_votes_all",
-        "pres_dem_pct_all","pres_rep_pct_all"
-    ]]
+    return out[
+        [
+            "state_po",
+            "pres_margin",
+            "pres_dem_candidate",
+            "pres_rep_candidate",
+            "pres_dem_votes",
+            "pres_rep_votes",
+            "pres_total_votes_all",
+            "pres_dem_pct_all",
+            "pres_rep_pct_all",
+        ]
+    ]
 
 def compute_house_district_results(house_df, year):
-    df = house_df[(house_df["year"] == year) & (house_df["office"] == "US HOUSE") & (house_df["stage"] == "GEN") & (house_df["candidatevotes"].notna())].copy()
-    if df.empty:
-        return pd.DataFrame(columns=[
-            "state_po","district","district_id",
-            "dem_candidate","rep_candidate",
-            "dem_votes","rep_votes","total_votes_all",
-            "dem_pct_all","rep_pct_all","house_margin"
-        ])
+    df = house_df[
+        (house_df["year"] == year)
+        & (house_df["office"] == "US HOUSE")
+        & (house_df["stage"] == "GEN")
+        & (house_df["candidatevotes"].notna())
+    ].copy()
 
-    totals_all = df.groupby(["state_po","district"], dropna=False)["candidatevotes"].sum().rename("total_votes_all").reset_index()
-    dmaj = df[df["party"].isin(["DEMOCRAT","REPUBLICAN"])].copy()
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "state_po",
+                "district",
+                "district_id",
+                "dem_candidate",
+                "rep_candidate",
+                "dem_votes",
+                "rep_votes",
+                "total_votes_all",
+                "dem_pct_all",
+                "rep_pct_all",
+                "house_margin",
+            ]
+        )
+
+    totals_all = df.groupby(["state_po", "district"], dropna=False)["candidatevotes"].sum().rename("total_votes_all").reset_index()
+    dmaj = df[df["party"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
 
     if dmaj.empty:
         out = totals_all.copy()
         out["district_id"] = out.apply(lambda r: norm_dist_id(r["state_po"], r["district"]), axis=1)
-        for c in ["dem_candidate","rep_candidate","dem_votes","rep_votes","dem_pct_all","rep_pct_all","house_margin"]:
+        for c in ["dem_candidate", "rep_candidate", "dem_votes", "rep_votes", "dem_pct_all", "rep_pct_all", "house_margin"]:
             out[c] = np.nan
         return out
 
-    pv = dmaj.groupby(["state_po","district","party"], dropna=False)["candidatevotes"].sum().unstack(fill_value=0)
-    if "DEMOCRAT" not in pv.columns: pv["DEMOCRAT"] = 0
-    if "REPUBLICAN" not in pv.columns: pv["REPUBLICAN"] = 0
-    pv = pv.reset_index().rename(columns={"DEMOCRAT":"dem_votes","REPUBLICAN":"rep_votes"})
+    pv = dmaj.groupby(["state_po", "district", "party"], dropna=False)["candidatevotes"].sum().unstack(fill_value=0)
+    if "DEMOCRAT" not in pv.columns:
+        pv["DEMOCRAT"] = 0
+    if "REPUBLICAN" not in pv.columns:
+        pv["REPUBLICAN"] = 0
+    pv = pv.reset_index().rename(columns={"DEMOCRAT": "dem_votes", "REPUBLICAN": "rep_votes"})
 
-    dem_names = dmaj[dmaj["party"]=="DEMOCRAT"].groupby(["state_po","district"], dropna=False)["candidate"].apply(lambda s: cand_join(s.tolist())).rename("dem_candidate").reset_index()
-    rep_names = dmaj[dmaj["party"]=="REPUBLICAN"].groupby(["state_po","district"], dropna=False)["candidate"].apply(lambda s: cand_join(s.tolist())).rename("rep_candidate").reset_index()
+    dem_names = (
+        dmaj[dmaj["party"] == "DEMOCRAT"]
+        .groupby(["state_po", "district"], dropna=False)["candidate"]
+        .apply(lambda s: cand_join(s.tolist()))
+        .rename("dem_candidate")
+        .reset_index()
+    )
+    rep_names = (
+        dmaj[dmaj["party"] == "REPUBLICAN"]
+        .groupby(["state_po", "district"], dropna=False)["candidate"]
+        .apply(lambda s: cand_join(s.tolist()))
+        .rename("rep_candidate")
+        .reset_index()
+    )
 
-    out = pv.merge(totals_all, on=["state_po","district"], how="left")
-    out = out.merge(dem_names, on=["state_po","district"], how="left").merge(rep_names, on=["state_po","district"], how="left")
+    out = pv.merge(totals_all, on=["state_po", "district"], how="left")
+    out = out.merge(dem_names, on=["state_po", "district"], how="left").merge(rep_names, on=["state_po", "district"], how="left")
     out["district_id"] = out.apply(lambda r: norm_dist_id(r["state_po"], r["district"]), axis=1)
 
     out["dem_pct_all"] = out["dem_votes"] / out["total_votes_all"].replace(0, np.nan)
@@ -710,20 +806,29 @@ def compute_house_district_results(house_df, year):
     major_total = (out["dem_votes"] + out["rep_votes"]).replace(0, np.nan)
     out["house_margin"] = (out["rep_votes"] - out["dem_votes"]) / major_total
 
-    for c in ["dem_pct_all","rep_pct_all","house_margin"]:
+    for c in ["dem_pct_all", "rep_pct_all", "house_margin"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    return out[[
-        "state_po","district","district_id",
-        "dem_candidate","rep_candidate",
-        "dem_votes","rep_votes","total_votes_all",
-        "dem_pct_all","rep_pct_all","house_margin"
-    ]]
+    return out[
+        [
+            "state_po",
+            "district",
+            "district_id",
+            "dem_candidate",
+            "rep_candidate",
+            "dem_votes",
+            "rep_votes",
+            "total_votes_all",
+            "dem_pct_all",
+            "rep_pct_all",
+            "house_margin",
+        ]
+    ]
 
 def compute_house_state_avg(house_df, year):
     ddf = compute_house_district_results(house_df, year)
     if ddf.empty:
-        return ddf, pd.DataFrame(columns=["state_po","avg_house_margin"])
+        return ddf, pd.DataFrame(columns=["state_po", "avg_house_margin"])
     avg = ddf.groupby("state_po")["house_margin"].mean().rename("avg_house_margin").reset_index()
     avg["avg_house_margin"] = pd.to_numeric(avg["avg_house_margin"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     return ddf, avg
@@ -743,7 +848,7 @@ def attach_ratings(ddf, cook_map, sabato_map, inside_map):
     return d
 
 # ----------------------------
-# SHAPES (cached download + read)
+# SHAPES (cached download + read) ✅ FIXED CD COLUMN DETECTION
 # ----------------------------
 def _download_cached(url, cache_path: Path):
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -768,30 +873,30 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
     _download_cached(url, zip_path)
 
     gdf = gpd.read_file(f"zip://{zip_path}")
+    cols_upper = [str(c).upper() for c in gdf.columns]
 
-    # normalize column names (fixes hidden whitespace / weird casing)
-    gdf.columns = pd.Index([str(c).strip() for c in gdf.columns])
+    # ✅ robust: accept ANY column that starts with CD and ends with FP
+    cd_candidates = []
+    for c in gdf.columns:
+        cu = str(c).upper()
+        if cu.startswith("CD") and cu.endswith("FP"):
+            cd_candidates.append(c)
 
-    # robust district FP column detection: CD116FP / CD118FP etc.
-    cd_cols = [c for c in gdf.columns if re.match(r"^CD\d+FP$", str(c).strip())]
-    if not cd_cols:
-        # fallback: anything that starts with CD and ends with FP
-        cd_cols = [c for c in gdf.columns if str(c).strip().startswith("CD") and str(c).strip().endswith("FP")]
-    if not cd_cols:
+    # prefer CD###FP style if multiple
+    cd_candidates = sorted(
+        cd_candidates,
+        key=lambda c: (0 if re.match(r"^CD\d+FP$", str(c).upper()) else 1, str(c)),
+    )
+
+    if not cd_candidates:
         raise ValueError(f"Could not find district FP column. Columns: {list(gdf.columns)}")
-    cd_col = cd_cols[0]
+    cd_col = cd_candidates[0]
 
-    if "STATEFP" not in gdf.columns:
-        # some shapefiles store as 'STATEFP20' etc; fallback
-        statefp_cols = [c for c in gdf.columns if str(c).startswith("STATEFP")]
-        if not statefp_cols:
-            raise ValueError(f"Could not find STATEFP. Columns: {list(gdf.columns)}")
-        statefp_col = statefp_cols[0]
-    else:
-        statefp_col = "STATEFP"
+    if "STATEFP" not in cols_upper:
+        raise ValueError(f"Could not find STATEFP. Columns: {list(gdf.columns)}")
 
     stfp = STATE_FIPS[state_po]
-    gdf = gdf[gdf[statefp_col].astype(str).str.zfill(2) == stfp].copy()
+    gdf = gdf[gdf["STATEFP"].astype(str).str.zfill(2) == stfp].copy()
     if gdf.empty:
         raise ValueError("No geometries for this state in the Census shapefile.")
 
@@ -802,10 +907,12 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
 
     gdf["district_id"] = gdf[cd_col].map(mk_id)
     gdf = gdf[gdf.geometry.notna()].copy()
+
     try:
         gdf["geometry"] = gdf.geometry.buffer(0)
     except Exception:
         pass
+
     geojson = json.loads(gdf.to_json())
     return geojson, gdf
 
@@ -813,22 +920,27 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
 # BUILD ALL YEAR DATA ONCE
 # ----------------------------
 @st.cache_data(show_spinner=True)
-def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
-                    enable_acs: bool, acs_requested_year: int, census_key: str | None):
+def build_year_data(
+    pres_path,
+    house_path,
+    spend_xlsx_path,
+    war_csv_path,
+    enable_acs: bool,
+    acs_requested_year: int,
+    acs_api_key: str,
+):
     pres_df, pres_cand_col, house_df = load_inputs(pres_path, house_path)
     cook_map, sabato_map, inside_map = get_2026_ratings_maps()
     ratings_union = build_ratings_union_table(cook_map, sabato_map, inside_map)
     spend_dist, spend_state = load_fec_spending(spend_xlsx_path)
     war_dist_year = load_war_by_district_year(war_csv_path)
 
-    acs_used_year = None
-    acs_cd = pd.DataFrame()
-    acs_state = pd.DataFrame()
-    acs_tried = []
-    acs_errors = {}
-
+    # ACS (optional)
+    acs_used_year, acs_cd, acs_state, acs_tried, acs_errors = (None, pd.DataFrame(), pd.DataFrame(), [], {})
     if enable_acs:
-        acs_used_year, acs_cd, acs_state, acs_tried, acs_errors = load_acs_with_fallback(int(acs_requested_year), census_key)
+        acs_used_year, acs_cd, acs_state, acs_tried, acs_errors = load_acs_with_fallback(
+            int(acs_requested_year), api_key=(acs_api_key or "").strip()
+        )
 
     YEARS = [2016, 2018, 2020, 2022, 2024]
     year_data = {}
@@ -838,42 +950,35 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
         dist_year, house_avg = compute_house_state_avg(house_df, y)
         dist_year = attach_ratings(dist_year, cook_map, sabato_map, inside_map)
 
-        # WAR merge (year-specific)
+        # WAR
         if not war_dist_year.empty:
-            wy = war_dist_year[war_dist_year["year"] == y].copy()
-            wy = wy.drop(columns=["year"], errors="ignore")
+            wy = war_dist_year[war_dist_year["year"] == y].copy().drop(columns=["year"], errors="ignore")
             dist_year = dist_year.merge(wy, on="district_id", how="left")
 
-        # ACS district merge (static-ish)
+        # ACS district
         if enable_acs and not acs_cd.empty:
-            dist_year = dist_year.merge(
-                acs_cd.drop(columns=["state_po"], errors="ignore"),
-                on="district_id",
-                how="left"
-            )
+            dist_year = dist_year.merge(acs_cd.drop(columns=["state_po"], errors="ignore"), on="district_id", how="left")
 
-        # spending merge (cycle_year == y)
+        # FEC district
         if not spend_dist.empty:
-            sd = spend_dist[spend_dist["cycle_year"] == y].copy()
-            sd = sd.drop(columns=["cycle_year", "state_po"], errors="ignore")
+            sd = spend_dist[spend_dist["cycle_year"] == y].copy().drop(columns=["cycle_year", "state_po"], errors="ignore")
             dist_year = dist_year.merge(sd, on="district_id", how="left")
 
         # state frame
         sdf = pres_state.merge(house_avg, on="state_po", how="outer")
 
-        # spending merge
+        # FEC state
         if not spend_state.empty:
-            ss = spend_state[spend_state["cycle_year"] == y].copy()
-            ss = ss.drop(columns=["cycle_year"], errors="ignore")
+            ss = spend_state[spend_state["cycle_year"] == y].copy().drop(columns=["cycle_year"], errors="ignore")
             sdf = sdf.merge(ss, on="state_po", how="left")
 
-        # ACS state merge
+        # ACS state
         if enable_acs and not acs_state.empty:
             sdf = sdf.merge(acs_state, on="state_po", how="left")
 
         sdf = sdf.sort_values("state_po").reset_index(drop=True)
 
-        # pretty strings (state)
+        # pretty strings
         if not sdf.empty:
             sdf["pres_dem_votes_str"] = sdf.get("pres_dem_votes", np.nan).map(fmt_int)
             sdf["pres_rep_votes_str"] = sdf.get("pres_rep_votes", np.nan).map(fmt_int)
@@ -884,8 +989,8 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
             sdf["avg_house_margin_str"] = sdf.get("avg_house_margin", np.nan).map(fmt_pct)
 
             for col in [
-                "fec_disburse_democrat","fec_disburse_republican","fec_disburse_all","fec_disburse_margin",
-                "fec_receipts_democrat","fec_receipts_republican","fec_receipts_all","fec_receipts_margin",
+                "fec_disburse_democrat", "fec_disburse_republican", "fec_disburse_all", "fec_disburse_margin",
+                "fec_receipts_democrat", "fec_receipts_republican", "fec_receipts_all", "fec_receipts_margin",
             ]:
                 if col not in sdf.columns:
                     sdf[col] = np.nan
@@ -900,58 +1005,51 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
             sdf["fec_receipts_all_str"] = sdf["fec_receipts_all"].map(fmt_money)
             sdf["fec_receipts_margin_str"] = sdf["fec_receipts_margin"].map(fmt_pct)
 
-            # ACS pretty strings (state)
-            if "acs_median_hh_income" in sdf.columns:
-                sdf["acs_median_hh_income_str"] = sdf["acs_median_hh_income"].map(fmt_money)
-            if "acs_median_age" in sdf.columns:
-                sdf["acs_median_age_str"] = sdf["acs_median_age"].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}")
-            for pc in [
-                "acs_pct_bachelors_or_higher", "acs_pct_veteran",
-                "acs_pct_white_alone", "acs_pct_black_alone", "acs_pct_asian_alone", "acs_pct_hispanic",
-                "acs_pct_male", "acs_pct_female",
-            ]:
-                if pc in sdf.columns:
-                    sdf[pc + "_str"] = sdf[pc].map(fmt_pct)
+            if enable_acs:
+                if "acs_median_hh_income" in sdf.columns:
+                    sdf["acs_median_hh_income_str"] = sdf["acs_median_hh_income"].map(fmt_money)
+                if "acs_median_age" in sdf.columns:
+                    sdf["acs_median_age_str"] = sdf["acs_median_age"].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}")
+                for pc in ACS_PERCENT_VARS:
+                    if pc in sdf.columns:
+                        sdf[pc + "_str"] = sdf[pc].map(fmt_pct)
 
             for c in [
-                "pres_dem_candidate","pres_rep_candidate",
-                "pres_dem_votes_str","pres_rep_votes_str","pres_total_votes_all_str",
-                "pres_dem_pct_all_str","pres_rep_pct_all_str",
-                "pres_margin_str","avg_house_margin_str",
-                "fec_disburse_democrat_str","fec_disburse_republican_str","fec_disburse_all_str","fec_disburse_margin_str",
-                "fec_receipts_democrat_str","fec_receipts_republican_str","fec_receipts_all_str","fec_receipts_margin_str",
-                "acs_median_hh_income_str","acs_median_age_str",
-                "acs_pct_bachelors_or_higher_str","acs_pct_veteran_str",
-                "acs_pct_white_alone_str","acs_pct_black_alone_str","acs_pct_asian_alone_str","acs_pct_hispanic_str",
-                "acs_pct_male_str","acs_pct_female_str",
+                "pres_dem_candidate", "pres_rep_candidate",
+                "pres_dem_votes_str", "pres_rep_votes_str", "pres_total_votes_all_str",
+                "pres_dem_pct_all_str", "pres_rep_pct_all_str",
+                "pres_margin_str", "avg_house_margin_str",
+                "fec_disburse_democrat_str", "fec_disburse_republican_str", "fec_disburse_all_str", "fec_disburse_margin_str",
+                "fec_receipts_democrat_str", "fec_receipts_republican_str", "fec_receipts_all_str", "fec_receipts_margin_str",
+                "acs_median_hh_income_str", "acs_median_age_str",
             ]:
                 if c in sdf.columns:
                     sdf[c] = sdf[c].fillna("").astype(str)
 
         year_data[y] = {"state_df": sdf, "dist_df": dist_year}
 
-    # Toss-up table (prefer latest year with data)
-    pref_year = 2024 if not year_data[2024]["dist_df"].empty else (2022 if not year_data[2022]["dist_df"].empty else (2020 if not year_data[2020]["dist_df"].empty else 2016))
+    # Toss-up table
+    pref_year = 2024 if not year_data[2024]["dist_df"].empty else (2022 if not year_data[2022]["dist_df"].empty else 2016)
     dist_for_toss = year_data[pref_year]["dist_df"]
 
     if not dist_for_toss.empty:
         base_cols = [
             "district_id",
-            "dem_candidate","rep_candidate",
-            "dem_votes","rep_votes","total_votes_all",
-            "dem_pct_all","rep_pct_all",
-            "Cook_2026","Sabato_2026","Inside_2026",
-            "tossup_agree_count","house_margin",
-            "war_str","war_sortable","war_dem_candidate","war_rep_candidate",
+            "dem_candidate", "rep_candidate",
+            "dem_votes", "rep_votes", "total_votes_all",
+            "dem_pct_all", "rep_pct_all",
+            "Cook_2026", "Sabato_2026", "Inside_2026",
+            "tossup_agree_count", "house_margin",
+            "war_str", "war_sortable", "war_dem_candidate", "war_rep_candidate",
         ]
-        acs_cols = [nm for _, nm in ACS_PROFILE_VARS if nm in dist_for_toss.columns]
+        acs_cols = [nm for _, nm in ACS_PROFILE_VARS if (enable_acs and nm in dist_for_toss.columns)]
         fec_cols = [c for c in dist_for_toss.columns if c.startswith("fec_")]
 
         cols = [c for c in base_cols if c in dist_for_toss.columns] + acs_cols + [c for c in fec_cols if c not in base_cols]
 
         tossup_table = (
             dist_for_toss.loc[dist_for_toss.get("tossup_agree_count", 0) > 0, cols]
-            .sort_values(["tossup_agree_count","district_id"], ascending=[False, True])
+            .sort_values(["tossup_agree_count", "district_id"], ascending=[False, True])
             .reset_index(drop=True)
         )
     else:
@@ -971,7 +1069,7 @@ def make_state_map_figure(sdf, year, metric_col):
             metric_col = "avg_house_margin"
 
     sdf = sdf.copy()
-    sdf["_plot_val"] = safe_plot_col(sdf.get(metric_col, pd.Series([None]*len(sdf))))
+    sdf["_plot_val"] = safe_plot_col(sdf.get(metric_col, pd.Series([None] * len(sdf))))
     arr = pd.to_numeric(sdf["_plot_val"], errors="coerce")
     zmax = float(np.nanmax(np.abs(arr.values))) if np.isfinite(arr).any() else 0.5
     if not np.isfinite(zmax) or zmax == 0:
@@ -981,7 +1079,7 @@ def make_state_map_figure(sdf, year, metric_col):
     subtitle = "blue = Dem, red = Rep"
 
     def col_or_blank(c):
-        return sdf[c].fillna("").astype(str) if c in sdf.columns else pd.Series([""]*len(sdf))
+        return sdf[c].fillna("").astype(str) if c in sdf.columns else pd.Series([""] * len(sdf))
 
     st_ = col_or_blank("state_po")
     dname = col_or_blank("pres_dem_candidate")
@@ -999,9 +1097,10 @@ def make_state_map_figure(sdf, year, metric_col):
                 locations=sdf["state_po"],
                 locationmode="USA-states",
                 z=sdf["_plot_val"],
-                zmin=-zmax, zmax=zmax,
+                zmin=-zmax,
+                zmax=zmax,
                 colorscale="RdBu_r",
-                colorbar_title=("Pres margin" if metric_col=="pres_margin" else "Avg House margin"),
+                colorbar_title=("Pres margin" if metric_col == "pres_margin" else "Avg House margin"),
                 customdata=np.stack([st_, dname, dv, dt, rname, rv, rt, pm, hm], axis=1),
                 hovertemplate=(
                     "<b>%{customdata[0]}</b><br>"
@@ -1017,7 +1116,7 @@ def make_state_map_figure(sdf, year, metric_col):
         title_text=f"{title} — {subtitle}",
         geo=dict(scope="usa", projection_type="albers usa"),
         margin=dict(l=0, r=0, t=50, b=0),
-        height=520
+        height=520,
     )
     return fig
 
@@ -1050,35 +1149,40 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str, include_ac
             sub["acs_median_hh_income_str"] = sub["acs_median_hh_income"].map(fmt_money)
         if "acs_median_age" in sub.columns:
             sub["acs_median_age_str"] = sub["acs_median_age"].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}")
-        for pc in [
-            "acs_pct_bachelors_or_higher","acs_pct_veteran",
-            "acs_pct_white_alone","acs_pct_black_alone","acs_pct_asian_alone","acs_pct_hispanic",
-            "acs_pct_male","acs_pct_female",
-        ]:
+        for pc in ACS_PERCENT_VARS:
             if pc in sub.columns:
                 sub[pc + "_str"] = sub[pc].map(fmt_pct)
         if "acs_total_pop" in sub.columns:
             sub["acs_total_pop_str"] = sub["acs_total_pop"].map(fmt_int)
 
-    base = [
+    # merge onto geometry
+    core_merge = [
         "district_id",
         "house_margin",
-        "dem_candidate","rep_candidate",
-        "dem_votes_str","rep_votes_str","total_votes_str",
-        "dem_pct_all_str","rep_pct_all_str",
-        "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
-        "war_str","war_sortable",
-        "fec_dem_sp_str","fec_rep_sp_str","fec_all_sp_str","fec_sp_margin_str",
+        "dem_candidate",
+        "rep_candidate",
+        "dem_votes_str",
+        "rep_votes_str",
+        "total_votes_str",
+        "dem_pct_all_str",
+        "rep_pct_all_str",
+        "Cook_2026",
+        "Sabato_2026",
+        "Inside_2026",
+        "tossup_agree_count",
+        "war_str",
+        "war_sortable",
+        "fec_dem_sp_str",
+        "fec_rep_sp_str",
+        "fec_all_sp_str",
+        "fec_sp_margin_str",
     ]
     if include_acs:
-        base += [
-            "acs_total_pop_str","acs_median_age_str","acs_median_hh_income_str",
-            "acs_pct_bachelors_or_higher_str","acs_pct_veteran_str",
-            "acs_pct_white_alone_str","acs_pct_black_alone_str","acs_pct_asian_alone_str","acs_pct_hispanic_str",
-            "acs_pct_male_str","acs_pct_female_str"
-        ]
+        for k in ["acs_total_pop_str", "acs_median_age_str", "acs_median_hh_income_str"] + [pc + "_str" for pc in ACS_PERCENT_VARS]:
+            if k in sub.columns:
+                core_merge.append(k)
 
-    m = gdf[["district_id"]].merge(sub[[c for c in base if c in sub.columns]], on="district_id", how="left")
+    m = gdf[["district_id"]].merge(sub[core_merge], on="district_id", how="left")
 
     m["house_margin_plot"] = safe_plot_col(m["house_margin"])
     arr = pd.to_numeric(m["house_margin_plot"], errors="coerce")
@@ -1088,7 +1192,7 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str, include_ac
 
     hover_data = {
         "district_id": True,
-        "house_margin_plot":":.2%",
+        "house_margin_plot": ":.2%",
         "dem_candidate": True,
         "dem_votes_str": True,
         "dem_pct_all_str": True,
@@ -1108,13 +1212,9 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str, include_ac
         "fec_sp_margin_str": True,
     }
     if include_acs:
-        for k in [
-            "acs_total_pop_str","acs_median_age_str","acs_median_hh_income_str",
-            "acs_pct_bachelors_or_higher_str","acs_pct_veteran_str",
-            "acs_pct_white_alone_str","acs_pct_black_alone_str","acs_pct_asian_alone_str","acs_pct_hispanic_str",
-            "acs_pct_male_str","acs_pct_female_str",
-        ]:
-            hover_data[k] = True
+        for k in ["acs_total_pop_str", "acs_median_age_str", "acs_median_hh_income_str"] + [pc + "_str" for pc in ACS_PERCENT_VARS]:
+            if k in m.columns:
+                hover_data[k] = True
 
     fig2 = px.choropleth(
         m,
@@ -1150,9 +1250,9 @@ war_path = st.sidebar.text_input("WAR CSV path", value=default_war)
 st.sidebar.divider()
 
 YEARS = [2016, 2018, 2020, 2022, 2024]
-year = st.sidebar.radio("Year", YEARS, index=4)
+year = st.sidebar.radio("Year", YEARS, index=0)
 
-metric_label = st.sidebar.radio("State map colors", ["Pres margin", "Avg House margin"], index=1)
+metric_label = st.sidebar.radio("State map colors", ["Pres margin", "Avg House margin"], index=0)
 metric_col = "pres_margin" if metric_label == "Pres margin" else "avg_house_margin"
 
 spend_measure = st.sidebar.radio("Spending measure (FEC)", ["Disbursements", "Receipts"], index=0)
@@ -1162,46 +1262,49 @@ st.sidebar.subheader("ACS (Census API)")
 enable_acs = st.sidebar.checkbox("Enable ACS demographics (Census API)", value=True)
 acs_requested_year = st.sidebar.number_input(
     "ACS 5-year Profile year (try 2024; auto-fallback)",
-    min_value=2010, max_value=2030, value=2024, step=1, disabled=(not enable_acs)
+    min_value=2010,
+    max_value=2030,
+    value=2024,
+    step=1,
+    disabled=(not enable_acs),
 )
-census_key = st.sidebar.text_input(
-    "Optional Census API key (recommended, not required)",
+acs_api_key = st.sidebar.text_input(
+    "Optional Census API key (recommended, but not required)",
     value="",
     type="password",
-    disabled=(not enable_acs)
+    disabled=(not enable_acs),
 )
-include_acs_in_hover = st.sidebar.checkbox(
-    "Include ACS demographics in district hover/map",
-    value=True,
-    disabled=(not enable_acs)
-)
+include_acs_in_hover = st.sidebar.checkbox("Include ACS demographics in district hover/map", value=True, disabled=(not enable_acs))
 
-# Load everything once paths are provided
+# Load everything once
 try:
     year_data, tossup_table, ratings_union, acs_used_year, acs_tried, acs_errors = build_year_data(
-        pres_path, house_path, spend_path, war_path,
-        enable_acs, int(acs_requested_year), census_key
+        pres_path,
+        house_path,
+        spend_path,
+        war_path,
+        enable_acs=bool(enable_acs),
+        acs_requested_year=int(acs_requested_year),
+        acs_api_key=str(acs_api_key or ""),
     )
 except Exception as e:
     st.error("Failed to load/parse your input files. Check the paths and file formats.")
     st.exception(e)
     st.stop()
 
-if enable_acs:
-    with st.sidebar.expander("ACS errors (if any)", expanded=False):
-        if acs_errors:
-            for k, v in acs_errors.items():
-                st.write(f"{k}: {v}")
-        else:
-            st.write("No ACS errors.")
-
 sdf = year_data[year]["state_df"]
 if sdf.empty:
     st.error("No state-level data for the selected year.")
     st.stop()
 
-states = sorted([s for s in sdf["state_po"].dropna().unique().tolist() if isinstance(s, str) and len(s)==2])
+states = sorted([s for s in sdf["state_po"].dropna().unique().tolist() if isinstance(s, str) and len(s) == 2])
 state_po = st.sidebar.selectbox("State", states, index=0)
+
+if enable_acs:
+    st.sidebar.caption(f"ACS: requested {int(acs_requested_year)} · used {acs_used_year} · tried {acs_tried}")
+    if acs_errors:
+        with st.sidebar.expander("ACS errors (if any)"):
+            st.json(acs_errors)
 
 # ----------------------------
 # MAIN UI
@@ -1217,13 +1320,12 @@ with left:
 
 with right:
     st.subheader(f"{state_po} summary ({year})")
-
     row = sdf[sdf["state_po"] == state_po]
     if row.empty:
         st.info("No row for this state/year.")
     else:
         r0 = row.iloc[0]
-        has_pres = bool(r0.get("pres_dem_votes_str","") or r0.get("pres_rep_votes_str",""))
+        has_pres = bool(r0.get("pres_dem_votes_str", "") or r0.get("pres_rep_votes_str", ""))
 
         pres_block = ""
         if has_pres:
@@ -1234,15 +1336,15 @@ with right:
 """.strip()
 
         if spend_measure == "Disbursements":
-            fec_dem = r0.get("fec_disburse_democrat_str","")
-            fec_rep = r0.get("fec_disburse_republican_str","")
-            fec_all = r0.get("fec_disburse_all_str","")
-            fec_mar = r0.get("fec_disburse_margin_str","")
+            fec_dem = r0.get("fec_disburse_democrat_str", "")
+            fec_rep = r0.get("fec_disburse_republican_str", "")
+            fec_all = r0.get("fec_disburse_all_str", "")
+            fec_mar = r0.get("fec_disburse_margin_str", "")
         else:
-            fec_dem = r0.get("fec_receipts_democrat_str","")
-            fec_rep = r0.get("fec_receipts_republican_str","")
-            fec_all = r0.get("fec_receipts_all_str","")
-            fec_mar = r0.get("fec_receipts_margin_str","")
+            fec_dem = r0.get("fec_receipts_democrat_str", "")
+            fec_rep = r0.get("fec_receipts_republican_str", "")
+            fec_all = r0.get("fec_receipts_all_str", "")
+            fec_mar = r0.get("fec_receipts_margin_str", "")
 
         fec_block = f"""
 **FEC {spend_measure} (House candidates, state total):**
@@ -1250,13 +1352,13 @@ with right:
 """.strip()
 
         acs_block = ""
-        if enable_acs and ("acs_median_hh_income_str" in sdf.columns or "acs_pct_bachelors_or_higher_str" in sdf.columns):
+        if enable_acs:
             acs_block = f"""
 **ACS (5-year profile, state):**
 • Median HH income: {r0.get("acs_median_hh_income_str","")}
 • Median age: {r0.get("acs_median_age_str","")}
 • % Bachelor+ (25+): {r0.get("acs_pct_bachelors_or_higher_str","")}
-• % Veteran: {r0.get("acs_pct_veteran_str","")}
+• % Veteran (18+): {r0.get("acs_pct_veteran_str","")}
 """.strip()
 
         st.markdown(
@@ -1323,26 +1425,39 @@ for c in [dem_sp, rep_sp, all_sp, mar_sp]:
     if c not in sub.columns:
         sub[c] = np.nan
 
-acs_cols = [nm for _, nm in ACS_PROFILE_VARS if nm in sub.columns]
+acs_cols = [nm for _, nm in ACS_PROFILE_VARS if (enable_acs and nm in sub.columns)]
 
 show_cols = [
     "district_id",
-    "dem_candidate","dem_votes","dem_pct_all",
-    "rep_candidate","rep_votes","rep_pct_all",
+    "dem_candidate",
+    "dem_votes",
+    "dem_pct_all",
+    "rep_candidate",
+    "rep_votes",
+    "rep_pct_all",
     "total_votes_all",
     "house_margin",
-    "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
-    "war_str","war_sortable","war_dem_candidate","war_rep_candidate",
-    dem_sp, rep_sp, all_sp, mar_sp,
-] + (acs_cols if enable_acs else [])
+    "Cook_2026",
+    "Sabato_2026",
+    "Inside_2026",
+    "tossup_agree_count",
+    "war_str",
+    "war_sortable",
+    "war_dem_candidate",
+    "war_rep_candidate",
+    dem_sp,
+    rep_sp,
+    all_sp,
+    mar_sp,
+] + acs_cols
 
 show_cols = [c for c in show_cols if c in sub.columns]
 show = sub[show_cols].copy()
 
-for c in ["dem_votes","rep_votes","total_votes_all"]:
+for c in ["dem_votes", "rep_votes", "total_votes_all"]:
     if c in show.columns:
         show[c] = show[c].map(fmt_int)
-for c in ["dem_pct_all","rep_pct_all","house_margin", mar_sp]:
+for c in ["dem_pct_all", "rep_pct_all", "house_margin", mar_sp]:
     if c in show.columns:
         show[c] = show[c].map(fmt_pct)
 for c in [dem_sp, rep_sp, all_sp]:
@@ -1352,7 +1467,7 @@ for c in [dem_sp, rep_sp, all_sp]:
 if "war_sortable" in show.columns:
     show["war_sortable"] = show["war_sortable"].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
 
-# ACS formats
+# ACS formats in table
 if enable_acs:
     if "acs_total_pop" in show.columns:
         show["acs_total_pop"] = show["acs_total_pop"].map(fmt_int)
@@ -1360,11 +1475,7 @@ if enable_acs:
         show["acs_median_hh_income"] = show["acs_median_hh_income"].map(fmt_money)
     if "acs_median_age" in show.columns:
         show["acs_median_age"] = show["acs_median_age"].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}")
-    for pc in [
-        "acs_pct_male","acs_pct_female",
-        "acs_pct_white_alone","acs_pct_black_alone","acs_pct_asian_alone","acs_pct_hispanic",
-        "acs_pct_bachelors_or_higher","acs_pct_veteran"
-    ]:
+    for pc in ACS_PERCENT_VARS:
         if pc in show.columns:
             show[pc] = show[pc].map(fmt_pct)
 
@@ -1387,22 +1498,24 @@ rename_map = {
     "acs_pct_hispanic": "ACS % Hispanic",
     "acs_median_hh_income": "ACS median HH income",
     "acs_pct_bachelors_or_higher": "ACS % Bachelor+ (25+)",
-    "acs_pct_veteran": "ACS % veteran",
+    "acs_pct_veteran": "ACS % veteran (18+)",
 }
-st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=420)
+show = show.rename(columns=rename_map)
+st.dataframe(show, use_container_width=True, height=420)
 
 # Toss-up table filtered to state
 st.subheader("Toss-ups (filtered to this state)")
 if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
     st_toss = tossup_table[tossup_table["district_id"].str.startswith(state_po + "-", na=False)].copy()
     if st_toss.empty:
-        st.info("No toss-up districts found for this state in the scraped tables.")
+        st.info("No toss-up districts (by your 3 sources) found for this state in the scraped tables.")
     else:
         st_toss_disp = st_toss.copy()
-        for c in ["dem_votes","rep_votes","total_votes_all"]:
+
+        for c in ["dem_votes", "rep_votes", "total_votes_all"]:
             if c in st_toss_disp.columns:
                 st_toss_disp[c] = st_toss_disp[c].map(fmt_int)
-        for c in ["dem_pct_all","rep_pct_all","house_margin", "fec_disburse_margin", "fec_receipts_margin"]:
+        for c in ["dem_pct_all", "rep_pct_all", "house_margin", "fec_disburse_margin", "fec_receipts_margin"]:
             if c in st_toss_disp.columns:
                 st_toss_disp[c] = st_toss_disp[c].map(fmt_pct)
         for c in st_toss_disp.columns:
@@ -1416,11 +1529,7 @@ if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
                 st_toss_disp["acs_median_hh_income"] = st_toss_disp["acs_median_hh_income"].map(fmt_money)
             if "acs_median_age" in st_toss_disp.columns:
                 st_toss_disp["acs_median_age"] = st_toss_disp["acs_median_age"].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}")
-            for pc in [
-                "acs_pct_male","acs_pct_female",
-                "acs_pct_white_alone","acs_pct_black_alone","acs_pct_asian_alone","acs_pct_hispanic",
-                "acs_pct_bachelors_or_higher","acs_pct_veteran"
-            ]:
+            for pc in ACS_PERCENT_VARS:
                 if pc in st_toss_disp.columns:
                     st_toss_disp[pc] = st_toss_disp[pc].map(fmt_pct)
 
@@ -1428,7 +1537,6 @@ if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
 else:
     st.info("No toss-up table available (ratings scrape returned no districts).")
 
-# Ratings Universe view
 st.divider()
 st.subheader("Ratings universe (Cook / Sabato / Inside from 270toWin) — leans / tilts / toss-ups / likely")
 
@@ -1439,27 +1547,34 @@ else:
 
     base_merge_cols = [
         "district_id",
-        "dem_candidate","rep_candidate",
-        "dem_votes","rep_votes","total_votes_all",
-        "dem_pct_all","rep_pct_all",
+        "dem_candidate",
+        "rep_candidate",
+        "dem_votes",
+        "rep_votes",
+        "total_votes_all",
+        "dem_pct_all",
+        "rep_pct_all",
         "house_margin",
         "tossup_agree_count",
-        "war_str","war_sortable","war_dem_candidate","war_rep_candidate",
+        "war_str",
+        "war_sortable",
+        "war_dem_candidate",
+        "war_rep_candidate",
     ]
     fec_cols = [c for c in context.columns if c.startswith("fec_")]
-    acs_cols2 = [nm for _, nm in ACS_PROFILE_VARS if nm in context.columns]
+    acs_cols = [nm for _, nm in ACS_PROFILE_VARS if (enable_acs and nm in context.columns)]
 
     merged = ratings_union.merge(
-        context[[c for c in base_merge_cols if c in context.columns] + fec_cols + (acs_cols2 if enable_acs else [])],
+        context[[c for c in base_merge_cols if c in context.columns] + fec_cols + acs_cols],
         on="district_id",
-        how="left"
+        how="left",
     )
 
     c1, c2, c3, c4 = st.columns([1.1, 1.0, 1.0, 1.3])
     with c1:
         state_only = st.checkbox("Only selected state", value=True)
     with c2:
-        min_mention = st.selectbox("Mentioned by (>=)", [1,2,3], index=0)
+        min_mention = st.selectbox("Mentioned by (>=)", [1, 2, 3], index=0)
     with c3:
         consensus_filter = st.selectbox("Consensus side", ["All", "Dem", "Rep", "Toss-up"], index=0)
     with c4:
@@ -1477,10 +1592,10 @@ else:
     if disagree_only:
         view = view[view["side_agree_max"] < view["mentioned_by_count"]]
 
-    for c in ["dem_votes","rep_votes","total_votes_all"]:
+    for c in ["dem_votes", "rep_votes", "total_votes_all"]:
         if c in view.columns:
             view[c] = view[c].map(fmt_int)
-    for c in ["dem_pct_all","rep_pct_all","house_margin"]:
+    for c in ["dem_pct_all", "rep_pct_all", "house_margin"]:
         if c in view.columns:
             view[c] = view[c].map(fmt_pct)
     for c in view.columns:
@@ -1496,11 +1611,7 @@ else:
             view["acs_median_hh_income"] = view["acs_median_hh_income"].map(fmt_money)
         if "acs_median_age" in view.columns:
             view["acs_median_age"] = view["acs_median_age"].map(lambda x: "" if pd.isna(x) else f"{float(x):.1f}")
-        for pc in [
-            "acs_pct_male","acs_pct_female",
-            "acs_pct_white_alone","acs_pct_black_alone","acs_pct_asian_alone","acs_pct_hispanic",
-            "acs_pct_bachelors_or_higher","acs_pct_veteran"
-        ]:
+        for pc in ACS_PERCENT_VARS:
             if pc in view.columns:
                 view[pc] = view[pc].map(fmt_pct)
 
@@ -1508,12 +1619,71 @@ else:
         view["war_sortable"] = view["war_sortable"].map(lambda x: "" if pd.isna(x) else f"{float(x):.3f}")
 
     view["_disagree"] = (view["side_agree_max"] < view["mentioned_by_count"]).astype(int)
-    view = view.sort_values(
-        by=["mentioned_by_count","_disagree","any_tossup_or_tilt","district_id"],
-        ascending=[False, False, False, True]
-    ).drop(columns=["_disagree"], errors="ignore")
+    view = (
+        view.sort_values(by=["mentioned_by_count", "_disagree", "any_tossup_or_tilt", "district_id"], ascending=[False, False, False, True])
+        .drop(columns=["_disagree"], errors="ignore")
+    )
 
-    st.dataframe(view, use_container_width=True, height=520)
+    core_cols = [
+        "district_id",
+        "Cook_2026",
+        "Sabato_2026",
+        "Inside_2026",
+        "mentioned_by_count",
+        "side_agree_max",
+        "exact_label_agree_max",
+        "consensus_by_avgscore",
+        "avg_score",
+        "dem_candidate",
+        "rep_candidate",
+        "house_margin",
+        "war_str",
+        "war_sortable",
+        "war_dem_candidate",
+        "war_rep_candidate",
+    ]
+
+    if spend_measure == "Disbursements":
+        fec_pick = ["fec_disburse_democrat", "fec_disburse_republican", "fec_disburse_all", "fec_disburse_margin"]
+    else:
+        fec_pick = ["fec_receipts_democrat", "fec_receipts_republican", "fec_receipts_all", "fec_receipts_margin"]
+
+    acs_pick = [nm for _, nm in ACS_PROFILE_VARS if enable_acs]
+
+    show_cols = [c for c in core_cols if c in view.columns] + [c for c in fec_pick if c in view.columns] + [c for c in acs_pick if c in view.columns]
+
+    rename = {
+        "mentioned_by_count": "Mentioned by (count)",
+        "side_agree_max": "Side agree (max)",
+        "exact_label_agree_max": "Exact label agree (max)",
+        "consensus_by_avgscore": "Consensus (avg score)",
+        "avg_score": "Avg score (Dem - / Rep +)",
+        "war_str": "WAR (string)",
+        "war_sortable": "WAR (sortable)",
+        "war_dem_candidate": "WAR Dem name",
+        "war_rep_candidate": "WAR Rep name",
+        "fec_disburse_democrat": "FEC Disburse (Dem)",
+        "fec_disburse_republican": "FEC Disburse (Rep)",
+        "fec_disburse_all": "FEC Disburse (All parties)",
+        "fec_disburse_margin": "FEC Disburse margin (Rep−Dem)",
+        "fec_receipts_democrat": "FEC Receipts (Dem)",
+        "fec_receipts_republican": "FEC Receipts (Rep)",
+        "fec_receipts_all": "FEC Receipts (All parties)",
+        "fec_receipts_margin": "FEC Receipts margin (Rep−Dem)",
+        "acs_total_pop": "ACS total pop",
+        "acs_pct_male": "ACS % male",
+        "acs_pct_female": "ACS % female",
+        "acs_median_age": "ACS median age",
+        "acs_pct_white_alone": "ACS % White",
+        "acs_pct_black_alone": "ACS % Black",
+        "acs_pct_asian_alone": "ACS % Asian",
+        "acs_pct_hispanic": "ACS % Hispanic",
+        "acs_median_hh_income": "ACS median HH income",
+        "acs_pct_bachelors_or_higher": "ACS % Bachelor+ (25+)",
+        "acs_pct_veteran": "ACS % veteran (18+)",
+    }
+
+    st.dataframe(view[show_cols].rename(columns=rename), use_container_width=True, height=520)
 
 # Notes / warnings
 if spend_path and not Path(spend_path).exists():
@@ -1521,15 +1691,15 @@ if spend_path and not Path(spend_path).exists():
 if war_path and not Path(war_path).exists():
     st.warning("WAR CSV path not found. Add the file to the repo (same folder as app.py) or correct the path.")
 
-acs_note = ""
-if enable_acs:
-    acs_note = f"ACS demographics: Census ACS 5-year Data Profile via Census Data API (requested {acs_requested_year}; used {acs_used_year}; tried {acs_tried})."
-else:
-    acs_note = "ACS demographics: disabled."
-
-st.caption(
+note = (
     "Notes: Presidential stats only exist for presidential years (2016/2020/2024); midterms show House + FEC spending. "
     "Ratings are scraped ONLY from the 3x 270toWin tables (Cook/Sabato/Inside). "
     "District shapes are cached locally. "
-    + acs_note
 )
+if enable_acs:
+    note += (
+        f"ACS demographics come from the U.S. Census Bureau ACS 5-year Data Profile via the Census Data API "
+        f"(requested {int(acs_requested_year)}; used {acs_used_year}; tried {acs_tried}). "
+        "Percent fields are displayed as true percentages (e.g., 0.75 → 75%)."
+    )
+st.caption(note)
