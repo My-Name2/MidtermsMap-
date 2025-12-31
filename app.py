@@ -719,6 +719,7 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
     state_po = state_po.upper().strip()
     if state_po not in STATE_FIPS:
         raise ValueError(f"Unknown state_po: {state_po}")
+
     url = CD_ZIPS.get(year)
     if not url:
         raise ValueError(f"No Census district shapes configured for year={year}")
@@ -728,10 +729,18 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
     _download_cached(url, zip_path)
 
     gdf = gpd.read_file(f"zip://{zip_path}")
-    cd_cols = [c for c in gdf.columns if re.match(r"^CD\\d+FP$", str(c))]
+
+    # ✅ FIX: use \d (digits), not \\d (literal backslash-d)
+    cd_cols = [c for c in gdf.columns if re.match(r"^CD\d+FP$", str(c), flags=re.I)]
+    if not cd_cols:
+        # extra fallback: sometimes the column name varies slightly
+        cd_cols = [c for c in gdf.columns if str(c).upper().startswith("CD") and str(c).upper().endswith("FP")]
+
     if not cd_cols:
         raise ValueError(f"Could not find district FP column. Columns: {list(gdf.columns)}")
+
     cd_col = cd_cols[0]
+
     if "STATEFP" not in gdf.columns:
         raise ValueError(f"Could not find STATEFP. Columns: {list(gdf.columns)}")
 
@@ -747,12 +756,15 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
 
     gdf["district_id"] = gdf[cd_col].map(mk_id)
     gdf = gdf[gdf.geometry.notna()].copy()
+
     try:
         gdf["geometry"] = gdf.geometry.buffer(0)
     except Exception:
         pass
+
     geojson = json.loads(gdf.to_json())
     return geojson, gdf
+
 
 # ----------------------------
 # BUILD ALL YEAR DATA ONCE
