@@ -1,10 +1,24 @@
 # ============================================
-# STREAMLIT APP: US Elections Explorer
+# STREAMLIT APP: US state map + state district map (Census shapes)
 # - Years: 2016 / 2018 / 2020 / 2022 / 2024
 # - State map colors: Pres margin OR Avg House margin
-# - District hover includes: House candidates/votes + 2026 ratings + FEC spending + (NEW) WAR
-# - NEW: Ratings Universe view (Cook/Sabato/Inside from ONLY 3x 270toWin URLs)
-# - NEW: WAR file merge into Ratings Universe (by district_id + year; with basic name-match diagnostics)
+# - State hover includes (when presidential data exists for that year):
+#   * Pres Dem/Rep candidate names
+#   * Pres Dem/Rep votes + % of ALL presidential votes in the state
+#   * Pres margin (Rep-Dem over Dem+Rep)
+#   * Avg House margin
+# - District hover includes:
+#   * House Dem/Rep candidates
+#   * votes + % of ALL House votes in the district
+#   * House margin (Rep-Dem over Dem+Rep)
+#   * 2026 Cook / Sabato / Inside + toss-up agreement
+#   * FEC spending (Dem/Rep/Total + spending margin) for selected cycle year
+# - NEW: Ratings Universe view (Cook/Sabato/Inside from the 3x 270toWin URLs ONLY)
+#   * union of ALL districts mentioned by the three sources (leans/tilts/toss-ups/likely/etc.)
+#   * agreement metrics + optional merge-in of election + FEC context for selected year
+# - NEW: WAR (wins above replacement) CSV merged into Ratings Universe + district context
+#   * WAR CSV columns expected (your file): Year, Chamber, Geography, Democrat, Republican, WAR, Sortable
+#   * Geography normalized to district_id; supports no leading zeros (AZ-1 vs AZ-01)
 # ============================================
 
 import re
@@ -15,13 +29,10 @@ import numpy as np
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-
+import geopandas as gpd
 import plotly.express as px
 import plotly.graph_objects as go
-
-import geopandas as gpd
 import streamlit as st
-
 
 # ----------------------------
 # CONFIG
@@ -31,12 +42,13 @@ st.set_page_config(page_title="US Elections Explorer", layout="wide")
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.270towin.com/",
 }
-
 
 # ----------------------------
 # URLS (2026 ratings) — ONLY these 3
@@ -44,7 +56,6 @@ UA = {
 URL_COOK_270 = "https://www.270towin.com/2026-house-election/index_show_table.php?map_title=cook-political-report-2026-house-ratings"
 URL_SABATO_270 = "https://www.270towin.com/2026-house-election/table/crystal-ball-2026-house-forecast"
 URL_INSIDE_270 = "https://www.270towin.com/2026-house-election/table/inside-elections-2026-house-ratings"
-
 
 # ----------------------------
 # DISTRICT SHAPES (Census cartographic boundary)
@@ -67,13 +78,11 @@ STATE_FIPS = {
     "UT":"49","VT":"50","VA":"51","WA":"53","WV":"54","WI":"55","WY":"56","PR":"72"
 }
 
-
 # ----------------------------
 # HELPERS
 # ----------------------------
 
 RATING_KEYS = ["Likely Dem", "Leans Dem", "Tilt Dem", "Toss-up", "Tilt Rep", "Leans Rep", "Likely Rep"]
-
 RATING_SCORE = {
     "Likely Dem": -3,
     "Leans Dem": -2,
@@ -84,20 +93,9 @@ RATING_SCORE = {
     "Likely Rep": 3,
 }
 
-# More flexible district capture:
-# - Accept hyphen / en-dash / em-dash
-# - Accept 01 or 1
-# - Accept AL or 00 or "At Large"/"At-Large"
-DIST_ANY_RE = re.compile(
-    r"\b([A-Z]{2})\s*[-–—]\s*(AL|00|\d{1,2}|AT\s*LARGE|AT-LARGE)\b",
-    re.I
-)
-
-
-def safe_plot_col(series):
+def safe_plot_col(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan)
     return s.apply(lambda x: None if (x is None or (isinstance(x, float) and not np.isfinite(x)) or pd.isna(x)) else float(x))
-
 
 def fmt_int(x):
     try:
@@ -107,7 +105,6 @@ def fmt_int(x):
     except Exception:
         return ""
 
-
 def fmt_pct(x):
     try:
         if pd.isna(x):
@@ -116,7 +113,6 @@ def fmt_pct(x):
     except Exception:
         return ""
 
-
 def fmt_money(x):
     try:
         if pd.isna(x):
@@ -124,7 +120,6 @@ def fmt_money(x):
         return f"${float(x):,.0f}"
     except Exception:
         return ""
-
 
 def norm_dist_id(st, dist):
     st = (st or "").strip().upper()
@@ -138,7 +133,6 @@ def norm_dist_id(st, dist):
         return f"{st}-AL"
     return f"{st}-{d}"
 
-
 def cand_join(names):
     names = [n for n in names if n and str(n).strip()]
     names = [str(n).strip() for n in names]
@@ -146,44 +140,13 @@ def cand_join(names):
     names = sorted(set(names))
     return " / ".join(names[:3]) if names else ""
 
-
-def normalize_rating_label(raw: str) -> str:
-    s = (raw or "").strip().lower()
-    s = s.replace("toss up", "toss-up").replace("tossup", "toss-up")
+def normalize_rating_label(s):
+    s = str(s).strip().lower().replace("toss up", "toss-up")
     s = re.sub(r"\s+", " ", s)
-
-    # Normalize common shorthand variants
-    # e.g. "Likely D", "Lean D", "Tilt R"
-    if "toss-up" in s or s == "toss":
-        return "Toss-up"
-
-    # Dem
-    if "likely" in s and (" dem" in s or s.endswith(" d") or " d " in s):
-        return "Likely Dem"
-    if ("lean" in s or "leans" in s) and (" dem" in s or s.endswith(" d") or " d " in s):
-        return "Leans Dem"
-    if "tilt" in s and (" dem" in s or s.endswith(" d") or " d " in s):
-        return "Tilt Dem"
-
-    # Rep
-    if "likely" in s and (" rep" in s or s.endswith(" r") or " r " in s):
-        return "Likely Rep"
-    if ("lean" in s or "leans" in s) and (" rep" in s or s.endswith(" r") or " r " in s):
-        return "Leans Rep"
-    if "tilt" in s and (" rep" in s or s.endswith(" r") or " r " in s):
-        return "Tilt Rep"
-
-    # If already canonical
-    t = s.title().replace("Toss Up", "Toss-up")
-    if t in RATING_KEYS:
-        return t
-
-    return t
-
+    return s.title().replace("Toss Up", "Toss-up")
 
 def is_tossup(x):
     return normalize_rating_label(x) == "Toss-up"
-
 
 def rating_side(label: str) -> str:
     lab = normalize_rating_label(label)
@@ -195,11 +158,9 @@ def rating_side(label: str) -> str:
         return "Rep"
     return ""
 
-
 def rating_score(label: str):
     lab = normalize_rating_label(label)
     return RATING_SCORE.get(lab, np.nan)
-
 
 def consensus_label_from_avgscore(s):
     if pd.isna(s):
@@ -218,6 +179,12 @@ def consensus_label_from_avgscore(s):
         return "Leans Rep"
     return "Likely Rep"
 
+def mode_count(vals):
+    vals = [v for v in vals if v]
+    if not vals:
+        return 0
+    vc = pd.Series(vals).value_counts()
+    return int(vc.iloc[0])
 
 def party_simple_from_fec(party_str: str):
     p = (party_str or "").strip().lower()
@@ -227,70 +194,66 @@ def party_simple_from_fec(party_str: str):
         return "REPUBLICAN"
     return ""
 
+def _as_series(df: pd.DataFrame, col: str, default="") -> pd.Series:
+    """Return df[col] if it exists, else a same-length Series(default)."""
+    if col in df.columns:
+        return df[col]
+    return pd.Series([default] * len(df), index=df.index)
 
-def district_code_to_id(code: str):
-    # examples: "AL-01", "VT-00", sometimes "DC-00"
-    s = (code or "").strip().upper()
-    # accept dash variants too
-    s = re.sub(r"[–—]", "-", s)
-    m = re.match(r"^([A-Z]{2})-(\d{1,2}|AL|00)$", s)
-    if not m:
-        return ""
-    st, d = m.group(1), m.group(2)
-    if d in ("AL", "00"):
-        return f"{st}-AL"
-    try:
-        return f"{st}-{int(d)}"
-    except Exception:
-        return ""
-
-
-def mode_count(vals):
-    vals = [v for v in vals if v]
-    if not vals:
-        return 0
-    vc = pd.Series(vals).value_counts()
-    return int(vc.iloc[0])
-
-
-def find_district_ids_in_text(text: str):
-    if not text:
-        return []
-    s = str(text).upper()
-    ids = []
-    for m in DIST_ANY_RE.finditer(s):
-        st = m.group(1).upper()
-        raw_d = m.group(2).upper().replace("AT LARGE", "AL").replace("AT-LARGE", "AL")
-        if raw_d in ("AL", "00"):
-            ids.append(f"{st}-AL")
-        else:
-            try:
-                ids.append(f"{st}-{int(raw_d)}")
-            except Exception:
-                pass
-    return ids
-
-
-def normalize_name(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z\s]", " ", s)
+def _norm_name(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z\s\-']", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+def _last_name(s: str) -> str:
+    s = _norm_name(s)
+    if not s:
+        return ""
+    parts = s.split()
+    return parts[-1] if parts else ""
 
-def loose_name_match(a: str, b: str) -> bool:
-    a2, b2 = normalize_name(a), normalize_name(b)
-    if not a2 or not b2:
-        return False
-    # If one contains the other (handles middle initials, suffixes, etc.)
-    return (a2 in b2) or (b2 in a2)
+def _name_match_score(a: str, b: str) -> int:
+    """Cheap + robust: last-name exact match gets 1 else 0."""
+    la = _last_name(a)
+    lb = _last_name(b)
+    if not la or not lb:
+        return 0
+    return int(la == lb)
 
+def district_code_to_id(code: str):
+    """
+    Accepts:
+      - "AL-01", "AL-1", "AL-001"
+      - "VT-00" or "VT-0" -> VT-AL
+      - "AK-AL" -> AK-AL
+      - "DC-00" -> DC-AL
+    Returns canonical: "ST-AL" or "ST-<int>"
+    """
+    s = (code or "").strip().upper()
+    if not s:
+        return ""
+    s = s.replace("–", "-").replace("—", "-")
+    m = re.match(r"^([A-Z]{2})\s*-\s*(AL|AT\s*LARGE|AT-LARGE|\d{1,3})$", s)
+    if not m:
+        return ""
+    st, d = m.group(1), m.group(2)
+    d = d.replace(" ", "")
+    if d in ("AL", "ATLARGE", "AT-LARGE"):
+        return f"{st}-AL"
+    try:
+        di = int(d)
+        if di == 0:
+            return f"{st}-AL"
+        return f"{st}-{di}"
+    except Exception:
+        return ""
 
 # ----------------------------
 # HTML FETCH
 # ----------------------------
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def fetch_html(url, timeout=30):
+def fetch_html(url, timeout=45):
     try:
         r = requests.get(url, headers=UA, timeout=timeout)
         if r.status_code in (401, 403):
@@ -300,22 +263,45 @@ def fetch_html(url, timeout=30):
     except Exception:
         return ""
 
-
 # ----------------------------
 # RATINGS PARSERS (270toWin)
+# More robust than token-only: it still uses text, but extracts district patterns
+# in multiple formats, including no leading zeros.
 # ----------------------------
+DIST_ANY_RE = re.compile(
+    r"\b([A-Z]{2})\s*[-\s]\s*(AL|AT\s*LARGE|AT-LARGE|0{1,3}|\d{1,3})\b",
+    re.I
+)
+
+def _extract_district_ids_from_text(txt: str):
+    out = []
+    if not txt:
+        return out
+    for m in DIST_ANY_RE.finditer(txt.upper()):
+        st = m.group(1).upper()
+        d = m.group(2).upper().replace(" ", "")
+        if d in ("AL", "ATLARGE", "AT-LARGE"):
+            out.append(f"{st}-AL")
+        else:
+            try:
+                di = int(d)
+                out.append(f"{st}-AL" if di == 0 else f"{st}-{di}")
+            except Exception:
+                continue
+    return out
+
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
 def parse_270toWin_table_like(url):
     """
-    Robust-ish text-walk parser:
-    - Walk the page text tokens
-    - Whenever a rating label is encountered, set current bucket
-    - For subsequent tokens, capture district codes in many formats
+    Attempts to parse district -> rating label from a 270toWin ratings page.
+    Strategy:
+      - Pull page text (soup.get_text).
+      - Track current rating bucket whenever we see a rating key line.
+      - For subsequent lines, extract any district codes in flexible formats.
     """
     html = fetch_html(url)
     if not html:
         return {}
-
     soup = BeautifulSoup(html, "html.parser")
     tokens = [t.strip() for t in soup.get_text("\n").split("\n")]
     tokens = [t for t in tokens if t]
@@ -326,28 +312,21 @@ def parse_270toWin_table_like(url):
     for t in tokens:
         t_norm = normalize_rating_label(t)
 
-        # if this token looks like a rating header, update current bucket
-        if t_norm in RATING_KEYS:
-            current = t_norm
-            continue
-
-        # some pages use shorter headings like "Likely D" etc
-        # normalize_rating_label already converts those to canonical when it can
-        if t_norm in RATING_KEYS:
-            current = t_norm
-            continue
+        # rating bucket line?
+        for rk in RATING_KEYS:
+            if t_norm.startswith(rk):
+                current = rk
+                break
 
         if not current:
             continue
 
-        # capture district IDs from token
-        dids = find_district_ids_in_text(t)
-        if dids:
-            for did in dids:
-                out[did] = current
+        # extract district ids from this token
+        dids = _extract_district_ids_from_text(t)
+        for did in dids:
+            out[did] = current
 
     return out
-
 
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
 def get_2026_ratings_maps():
@@ -355,7 +334,6 @@ def get_2026_ratings_maps():
     sabato_map = parse_270toWin_table_like(URL_SABATO_270)
     inside_map = parse_270toWin_table_like(URL_INSIDE_270)
     return cook_map, sabato_map, inside_map
-
 
 def build_ratings_union_table(cook_map: dict, sabato_map: dict, inside_map: dict) -> pd.DataFrame:
     districts = sorted(set(list(cook_map.keys()) + list(sabato_map.keys()) + list(inside_map.keys())))
@@ -380,10 +358,12 @@ def build_ratings_union_table(cook_map: dict, sabato_map: dict, inside_map: dict
     )
 
     df["exact_label_agree_max"] = df.apply(
-        lambda r: mode_count([r["Cook_2026"], r["Sabato_2026"], r["Inside_2026"]]), axis=1
+        lambda r: mode_count([r["Cook_2026"], r["Sabato_2026"], r["Inside_2026"]]),
+        axis=1
     )
     df["side_agree_max"] = df.apply(
-        lambda r: mode_count([r["Cook_2026_side"], r["Sabato_2026_side"], r["Inside_2026_side"]]), axis=1
+        lambda r: mode_count([r["Cook_2026_side"], r["Sabato_2026_side"], r["Inside_2026_side"]]),
+        axis=1
     )
 
     df["avg_score"] = df[["Cook_2026_score", "Sabato_2026_score", "Inside_2026_score"]].mean(axis=1, skipna=True)
@@ -399,12 +379,10 @@ def build_ratings_union_table(cook_map: dict, sabato_map: dict, inside_map: dict
         return int(any(l in ("Toss-up", "Tilt Dem", "Tilt Rep") for l in labs if l))
 
     df["any_tossup_or_tilt"] = df.apply(any_competitive, axis=1)
-
     return df
 
-
 # ----------------------------
-# HOUSE LOADER (robust for the weird TAB + CSV variants)
+# HOUSE LOADER (robust)
 # ----------------------------
 def load_house_wrapped_quotes_csv(path):
     path = Path(path)
@@ -422,23 +400,21 @@ def load_house_wrapped_quotes_csv(path):
                 ln = ln[1:-1]
             parts = ln.split(",")
 
-            # merge extra commas in the candidate field
             if cand_idx is not None and len(parts) > len(header):
                 extra = len(parts) - len(header)
-                candidate_merged = ",".join(parts[cand_idx : cand_idx + extra + 1])
-                parts = parts[:cand_idx] + [candidate_merged] + parts[cand_idx + extra + 1 :]
+                candidate_merged = ",".join(parts[cand_idx: cand_idx + extra + 1])
+                parts = parts[:cand_idx] + [candidate_merged] + parts[cand_idx + extra + 1:]
 
             if len(parts) < len(header):
                 parts += [""] * (len(header) - len(parts))
             if len(parts) > len(header):
-                parts = parts[: len(header)]
+                parts = parts[:len(header)]
 
             rows.append(parts)
 
     df = pd.DataFrame(rows, columns=header)
     df.columns = df.columns.astype(str).str.strip().str.replace("\ufeff", "", regex=False)
     return df
-
 
 @st.cache_data(show_spinner=True)
 def load_inputs(pres_path, house_path):
@@ -451,43 +427,39 @@ def load_inputs(pres_path, house_path):
             house_df_try = pd.read_csv(house_path, sep="\t", low_memory=False)
         else:
             house_df_try = pd.read_csv(house_path, low_memory=False)
-
         house_df_try.columns = house_df_try.columns.astype(str).str.strip().str.replace("\ufeff", "", regex=False)
-        y = pd.to_numeric(house_df_try.get("year", pd.Series(dtype="object")), errors="coerce")
+        y = pd.to_numeric(_as_series(house_df_try, "year"), errors="coerce")
         if y.notna().sum() == 0:
             raise ValueError("House year didn't parse with normal read.")
         house_df = house_df_try
     except Exception:
         house_df = load_house_wrapped_quotes_csv(house_path)
 
-    # Normalize president
-    pres_df["year"] = pd.to_numeric(pres_df.get("year", pd.Series(dtype="object")), errors="coerce")
-    pres_df["party_simplified"] = pres_df.get("party_simplified", "").astype(str).str.strip().str.upper()
-    pres_df["state_po"] = pres_df.get("state_po", "").astype(str).str.strip().str.upper()
-    pres_df["candidatevotes"] = pd.to_numeric(pres_df.get("candidatevotes", pd.Series(dtype="object")), errors="coerce")
+    pres_df["year"] = pd.to_numeric(_as_series(pres_df, "year"), errors="coerce")
+    pres_df["party_simplified"] = _as_series(pres_df, "party_simplified").astype(str).str.strip().str.upper()
+    pres_df["state_po"] = _as_series(pres_df, "state_po").astype(str).str.strip().str.upper()
+    pres_df["candidatevotes"] = pd.to_numeric(_as_series(pres_df, "candidatevotes"), errors="coerce")
 
     pres_cand_col = "candidate" if "candidate" in pres_df.columns else None
     if pres_cand_col:
-        pres_df[pres_cand_col] = pres_df[pres_cand_col].fillna("").astype(str).str.strip()
+        pres_df[pres_cand_col] = _as_series(pres_df, pres_cand_col).fillna("").astype(str).str.strip()
 
-    # Normalize house
-    house_df["year"] = pd.to_numeric(house_df.get("year", pd.Series(dtype="object")), errors="coerce")
+    house_df["year"] = pd.to_numeric(_as_series(house_df, "year"), errors="coerce")
     for c in ["office", "stage", "party", "state_po", "candidate"]:
         if c in house_df.columns:
-            house_df[c] = house_df[c].fillna("").astype(str).str.strip().str.upper()
-    house_df["candidatevotes"] = pd.to_numeric(house_df.get("candidatevotes", pd.Series(dtype="object")), errors="coerce")
+            house_df[c] = _as_series(house_df, c).fillna("").astype(str).str.strip().str.upper()
 
+    house_df["candidatevotes"] = pd.to_numeric(_as_series(house_df, "candidatevotes"), errors="coerce")
     return pres_df, pres_cand_col, house_df
 
-
 # ----------------------------
-# LOAD FEC SPENDING (XLSX)
+# LOAD FEC SPENDING (EXCEL)
 # ----------------------------
 @st.cache_data(show_spinner=True)
 def load_fec_spending(spend_xlsx_path: str):
     """
-    Expects sheet 'House_Candidate_Spending' and columns like:
-    cycle_year, state_abbrev, district_code, party, receipts, disbursements, ...
+    Expects sheet 'House_Candidate_Spending' with columns like:
+      cycle_year, state_abbrev, district_code, party, receipts, disbursements, ...
     """
     if not spend_xlsx_path:
         return pd.DataFrame(), pd.DataFrame()
@@ -499,34 +471,23 @@ def load_fec_spending(spend_xlsx_path: str):
     df = pd.read_excel(p, sheet_name="House_Candidate_Spending")
     df.columns = [str(c).strip() for c in df.columns]
 
-    df["cycle_year"] = pd.to_numeric(df.get("cycle_year", np.nan), errors="coerce")
-    df["state_po"] = df.get("state_abbrev", "").astype(str).str.strip().str.upper()
-    df["district_id"] = df.get("district_code", "").astype(str).apply(district_code_to_id)
-    df["party_simple"] = df.get("party", "").astype(str).apply(party_simple_from_fec)
+    df["cycle_year"] = pd.to_numeric(_as_series(df, "cycle_year", np.nan), errors="coerce")
+    df["state_po"] = _as_series(df, "state_abbrev").astype(str).str.strip().str.upper()
+    df["district_id"] = _as_series(df, "district_code").astype(str).apply(district_code_to_id)
+    df["party_simple"] = _as_series(df, "party").astype(str).apply(party_simple_from_fec)
 
     for c in ["receipts", "disbursements", "cash_on_hand", "debts"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = pd.to_numeric(_as_series(df, c), errors="coerce")
 
-    # totals ALL parties
-    dist_all = (
-        df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]]
-        .sum()
-        .reset_index()
-        .rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
-    )
+    dist_all = df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]].sum().reset_index()
+    dist_all = dist_all.rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
 
-    # DEM/REP only
     maj = df[df["party_simple"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
     if maj.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    dist_party = (
-        maj.groupby(["cycle_year", "state_po", "district_id", "party_simple"])[["receipts", "disbursements"]]
-        .sum()
-        .reset_index()
-    )
-
+    dist_party = maj.groupby(["cycle_year", "state_po", "district_id", "party_simple"])[["receipts", "disbursements"]].sum().reset_index()
     piv = dist_party.pivot_table(
         index=["cycle_year", "state_po", "district_id"],
         columns="party_simple",
@@ -543,112 +504,43 @@ def load_fec_spending(spend_xlsx_path: str):
         if c not in spend_dist.columns:
             spend_dist[c] = 0.0
 
-    # receipts metrics
     spend_dist["fec_receipts_maj_total"] = spend_dist["fec_receipts_democrat"] + spend_dist["fec_receipts_republican"]
-    spend_dist["fec_receipts_margin"] = (
-        (spend_dist["fec_receipts_republican"] - spend_dist["fec_receipts_democrat"])
-        / spend_dist["fec_receipts_maj_total"].replace(0, np.nan)
-    )
+    spend_dist["fec_receipts_margin"] = (spend_dist["fec_receipts_republican"] - spend_dist["fec_receipts_democrat"]) / spend_dist["fec_receipts_maj_total"].replace(0, np.nan)
 
-    # disburse metrics
     spend_dist["fec_disburse_maj_total"] = spend_dist["fec_disburse_democrat"] + spend_dist["fec_disburse_republican"]
-    spend_dist["fec_disburse_margin"] = (
-        (spend_dist["fec_disburse_republican"] - spend_dist["fec_disburse_democrat"])
-        / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
-    )
+    spend_dist["fec_disburse_margin"] = (spend_dist["fec_disburse_republican"] - spend_dist["fec_disburse_democrat"]) / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
 
-    # state totals
-    spend_state = (
-        spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
-            [
-                "fec_receipts_democrat","fec_receipts_republican","fec_receipts_all",
-                "fec_disburse_democrat","fec_disburse_republican","fec_disburse_all",
-            ]
-        ]
-        .sum()
-        .reset_index()
-    )
+    spend_state = spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
+        ["fec_receipts_democrat", "fec_receipts_republican", "fec_receipts_all",
+         "fec_disburse_democrat", "fec_disburse_republican", "fec_disburse_all"]
+    ].sum().reset_index()
 
     spend_state["fec_receipts_maj_total"] = spend_state["fec_receipts_democrat"] + spend_state["fec_receipts_republican"]
-    spend_state["fec_receipts_margin"] = (
-        (spend_state["fec_receipts_republican"] - spend_state["fec_receipts_democrat"])
-        / spend_state["fec_receipts_maj_total"].replace(0, np.nan)
-    )
+    spend_state["fec_receipts_margin"] = (spend_state["fec_receipts_republican"] - spend_state["fec_receipts_democrat"]) / spend_state["fec_receipts_maj_total"].replace(0, np.nan)
 
     spend_state["fec_disburse_maj_total"] = spend_state["fec_disburse_democrat"] + spend_state["fec_disburse_republican"]
-    spend_state["fec_disburse_margin"] = (
-        (spend_state["fec_disburse_republican"] - spend_state["fec_disburse_democrat"])
-        / spend_state["fec_disburse_maj_total"].replace(0, np.nan)
-    )
+    spend_state["fec_disburse_margin"] = (spend_state["fec_disburse_republican"] - spend_state["fec_disburse_democrat"]) / spend_state["fec_disburse_maj_total"].replace(0, np.nan)
 
     return spend_dist, spend_state
 
-
 # ----------------------------
-# LOAD WAR (CSV)
+# LOAD WAR (CSV) — YOUR FILE FORMAT
 # ----------------------------
-def normalize_geo_to_district_id(geo: str) -> str:
-    """
-    WAR file Geography examples:
-      - "AZ-1" or "AZ-01"
-      - "AK-AL" / "VT-AL" or "VT-00"
-    Ratings universe wants:
-      - "AZ-1"
-      - "AK-AL"
-    """
-    s = (geo or "").strip().upper()
-    s = re.sub(r"[–—]", "-", s)
-
-    m = re.match(r"^([A-Z]{2})-(.+)$", s)
-    if not m:
-        return ""
-
-    st = m.group(1)
-    d = m.group(2).strip()
-
-    d = d.replace("AT LARGE", "AL").replace("AT-LARGE", "AL")
-    if d in ("AL", "00", "0"):
-        return f"{st}-AL"
-
-    # strip leading zeros and cast
-    try:
-        return f"{st}-{int(d)}"
-    except Exception:
-        # if it's something weird, keep raw-ish
-        return f"{st}-{d}"
-
-
-def parse_war_label_to_sortable(war_label: str):
-    """
-    WAR label examples: "D+1.3", "R+0.2"
-    Convention we want (matching your sheet):
-      - Dem advantage => negative sortable
-      - Rep advantage => positive sortable
-    """
-    s = (war_label or "").strip().upper().replace(" ", "")
-    m = re.match(r"^([DR])\+?(-?\d+(\.\d+)?)$", s)
-    if not m:
-        return np.nan
-
-    side = m.group(1)
-    val = float(m.group(2))
-    # If label is "D+1.3", sortable should be -1.3
-    if side == "D":
-        return -abs(val)
-    return abs(val)
-
-
 @st.cache_data(show_spinner=True)
 def load_war_by_district_year(war_csv_path: str) -> pd.DataFrame:
     """
-    Expected columns (case-insensitive):
+    Your CSV columns (from screenshot / file):
       Year, Chamber, Geography, Democrat, Republican, WAR, Sortable
-    Returns normalized:
-      year, district_id, war_label, war_sortable, war_democrat, war_republican, chamber
+
+    We normalize:
+      - year (numeric)
+      - district_id from Geography (handles AZ-1 vs AZ-01)
+      - war_sortable numeric (use Sortable if present; else parse WAR)
+      - war_label text (WAR)
+      - war_dem_candidate, war_rep_candidate text
     """
     if not war_csv_path:
         return pd.DataFrame()
-
     p = Path(war_csv_path)
     if not p.exists():
         return pd.DataFrame()
@@ -656,81 +548,53 @@ def load_war_by_district_year(war_csv_path: str) -> pd.DataFrame:
     df = pd.read_csv(p, low_memory=False)
     df.columns = [str(c).strip() for c in df.columns]
 
-    # map columns case-insensitively
-    colmap = {c.lower(): c for c in df.columns}
+    # Required-ish fields (but we still behave if missing)
+    df["year"] = pd.to_numeric(_as_series(df, "Year", np.nan), errors="coerce")
+    df["chamber"] = _as_series(df, "Chamber", "").fillna("").astype(str).str.strip().str.title()
 
-    def col(name, default=None):
-        return colmap.get(name.lower(), default)
+    df["district_id"] = _as_series(df, "Geography", "").fillna("").astype(str).str.strip().apply(district_code_to_id)
 
-    year_col = col("Year")
-    chamber_col = col("Chamber")
-    geo_col = col("Geography")
-    dem_col = col("Democrat")
-    rep_col = col("Republican")
-    war_col = col("WAR")
-    sortable_col = col("Sortable")
+    df["war_label"] = _as_series(df, "WAR", "").fillna("").astype(str).str.strip()
 
-    if year_col is None or geo_col is None:
-        return pd.DataFrame()
-
-    out = pd.DataFrame()
-    out["year"] = pd.to_numeric(df[year_col], errors="coerce")
-
-    if chamber_col and chamber_col in df.columns:
-        out["chamber"] = df[chamber_col].fillna("").astype(str).str.strip()
+    # prefer Sortable numeric if present
+    if "Sortable" in df.columns:
+        df["war_sortable"] = pd.to_numeric(_as_series(df, "Sortable"), errors="coerce")
     else:
-        out["chamber"] = ""
+        # parse "D+1.3" -> -1.3 ; "R+0.2" -> +0.2
+        def _parse_war(x):
+            s = (x or "").strip().upper()
+            m = re.match(r"^([DR])\s*\+\s*([0-9]*\.?[0-9]+)$", s)
+            if not m:
+                return np.nan
+            side, val = m.group(1), float(m.group(2))
+            return -val if side == "D" else val
+        df["war_sortable"] = df["war_label"].apply(_parse_war)
 
-    out["geography_raw"] = df[geo_col].fillna("").astype(str).str.strip()
-    out["district_id"] = out["geography_raw"].apply(normalize_geo_to_district_id)
+    df["war_dem_candidate"] = _as_series(df, "Democrat", "").fillna("").astype(str).str.strip()
+    df["war_rep_candidate"] = _as_series(df, "Republican", "").fillna("").astype(str).str.strip()
 
-    out["war_democrat"] = df[dem_col].fillna("").astype(str).str.strip() if dem_col in df.columns else ""
-    out["war_republican"] = df[rep_col].fillna("").astype(str).str.strip() if rep_col in df.columns else ""
-
-    out["war_label"] = df[war_col].fillna("").astype(str).str.strip() if war_col in df.columns else ""
-
-    if sortable_col in df.columns:
-        out["war_sortable"] = pd.to_numeric(df[sortable_col], errors="coerce")
-    else:
-        out["war_sortable"] = out["war_label"].apply(parse_war_label_to_sortable)
-
-    # keep only House rows if chamber is present and used
-    # (but don’t break if it’s empty)
-    out2 = out.copy()
-    if out2["chamber"].astype(str).str.len().sum() > 0:
-        out2 = out2[out2["chamber"].astype(str).str.lower().str.contains("house")].copy()
-
-    out2 = out2[out2["district_id"].astype(str).str.len() > 0].copy()
-    out2 = out2[out2["year"].notna()].copy()
-    out2 = out2.drop_duplicates(subset=["year", "district_id"], keep="first").reset_index(drop=True)
-
-    return out2
-
+    # keep only House rows if you want; your file has Chamber=House but we won't enforce hard
+    out = df[df["district_id"].astype(str).str.len() > 0].copy()
+    out = out[["year", "district_id", "war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate"]].copy()
+    return out
 
 # ----------------------------
 # COMPUTATIONS
 # ----------------------------
 def compute_pres_state_results(pres_df, pres_cand_col, year):
-    df = pres_df[
-        (pres_df["year"] == year)
-        & (pres_df["state_po"].notna())
-        & (pres_df["candidatevotes"].notna())
-    ].copy()
-
+    df = pres_df[(pres_df["year"] == year) & (pres_df["state_po"].notna()) & (pres_df["candidatevotes"].notna())].copy()
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "state_po","pres_margin",
-                "pres_dem_candidate","pres_rep_candidate",
-                "pres_dem_votes","pres_rep_votes","pres_total_votes_all",
-                "pres_dem_pct_all","pres_rep_pct_all",
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "state_po", "pres_margin",
+            "pres_dem_candidate", "pres_rep_candidate",
+            "pres_dem_votes", "pres_rep_votes", "pres_total_votes_all",
+            "pres_dem_pct_all", "pres_rep_pct_all"
+        ])
 
     tot_all = df.groupby("state_po")["candidatevotes"].sum().rename("pres_total_votes_all").reset_index()
-
     maj = df[df["party_simplified"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
     pv = maj.groupby(["state_po", "party_simplified"])["candidatevotes"].sum().unstack(fill_value=0)
+
     if "DEMOCRAT" not in pv.columns:
         pv["DEMOCRAT"] = 0
     if "REPUBLICAN" not in pv.columns:
@@ -739,29 +603,13 @@ def compute_pres_state_results(pres_df, pres_cand_col, year):
     pv = pv.reset_index().rename(columns={"DEMOCRAT": "pres_dem_votes", "REPUBLICAN": "pres_rep_votes"})
 
     if pres_cand_col:
-        dem_names = (
-            maj[maj["party_simplified"] == "DEMOCRAT"]
-            .groupby("state_po")[pres_cand_col]
-            .apply(lambda s: cand_join(s.tolist()))
-            .rename("pres_dem_candidate")
-            .reset_index()
-        )
-        rep_names = (
-            maj[maj["party_simplified"] == "REPUBLICAN"]
-            .groupby("state_po")[pres_cand_col]
-            .apply(lambda s: cand_join(s.tolist()))
-            .rename("pres_rep_candidate")
-            .reset_index()
-        )
+        dem_names = maj[maj["party_simplified"] == "DEMOCRAT"].groupby("state_po")[pres_cand_col].apply(lambda s: cand_join(s.tolist())).rename("pres_dem_candidate").reset_index()
+        rep_names = maj[maj["party_simplified"] == "REPUBLICAN"].groupby("state_po")[pres_cand_col].apply(lambda s: cand_join(s.tolist())).rename("pres_rep_candidate").reset_index()
     else:
         dem_names = pd.DataFrame({"state_po": pv["state_po"], "pres_dem_candidate": ""})
         rep_names = pd.DataFrame({"state_po": pv["state_po"], "pres_rep_candidate": ""})
 
-    out = (
-        pv.merge(tot_all, on="state_po", how="left")
-        .merge(dem_names, on="state_po", how="left")
-        .merge(rep_names, on="state_po", how="left")
-    )
+    out = pv.merge(tot_all, on="state_po", how="left").merge(dem_names, on="state_po", how="left").merge(rep_names, on="state_po", how="left")
 
     out["pres_dem_pct_all"] = out["pres_dem_votes"] / out["pres_total_votes_all"].replace(0, np.nan)
     out["pres_rep_pct_all"] = out["pres_rep_votes"] / out["pres_total_votes_all"].replace(0, np.nan)
@@ -772,15 +620,12 @@ def compute_pres_state_results(pres_df, pres_cand_col, year):
     for c in ["pres_dem_pct_all", "pres_rep_pct_all", "pres_margin"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    return out[
-        [
-            "state_po","pres_margin",
-            "pres_dem_candidate","pres_rep_candidate",
-            "pres_dem_votes","pres_rep_votes","pres_total_votes_all",
-            "pres_dem_pct_all","pres_rep_pct_all",
-        ]
-    ]
-
+    return out[[
+        "state_po", "pres_margin",
+        "pres_dem_candidate", "pres_rep_candidate",
+        "pres_dem_votes", "pres_rep_votes", "pres_total_votes_all",
+        "pres_dem_pct_all", "pres_rep_pct_all"
+    ]]
 
 def compute_house_district_results(house_df, year):
     df = house_df[
@@ -791,14 +636,13 @@ def compute_house_district_results(house_df, year):
     ].copy()
 
     if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "state_po","district","district_id",
-                "dem_candidate","rep_candidate",
-                "dem_votes","rep_votes","total_votes_all",
-                "dem_pct_all","rep_pct_all","house_margin",
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "state_po", "district", "district_id",
+            "dem_candidate", "rep_candidate",
+            "dem_votes", "rep_votes", "total_votes_all",
+            "dem_pct_all", "rep_pct_all",
+            "house_margin"
+        ])
 
     totals_all = df.groupby(["state_po", "district"], dropna=False)["candidatevotes"].sum().rename("total_votes_all").reset_index()
 
@@ -806,7 +650,7 @@ def compute_house_district_results(house_df, year):
     if dmaj.empty:
         out = totals_all.copy()
         out["district_id"] = out.apply(lambda r: norm_dist_id(r["state_po"], r["district"]), axis=1)
-        for c in ["dem_candidate","rep_candidate","dem_votes","rep_votes","dem_pct_all","rep_pct_all","house_margin"]:
+        for c in ["dem_candidate", "rep_candidate", "dem_votes", "rep_votes", "dem_pct_all", "rep_pct_all", "house_margin"]:
             out[c] = np.nan
         return out
 
@@ -818,20 +662,8 @@ def compute_house_district_results(house_df, year):
 
     pv = pv.reset_index().rename(columns={"DEMOCRAT": "dem_votes", "REPUBLICAN": "rep_votes"})
 
-    dem_names = (
-        dmaj[dmaj["party"] == "DEMOCRAT"]
-        .groupby(["state_po", "district"], dropna=False)["candidate"]
-        .apply(lambda s: cand_join(s.tolist()))
-        .rename("dem_candidate")
-        .reset_index()
-    )
-    rep_names = (
-        dmaj[dmaj["party"] == "REPUBLICAN"]
-        .groupby(["state_po", "district"], dropna=False)["candidate"]
-        .apply(lambda s: cand_join(s.tolist()))
-        .rename("rep_candidate")
-        .reset_index()
-    )
+    dem_names = dmaj[dmaj["party"] == "DEMOCRAT"].groupby(["state_po", "district"], dropna=False)["candidate"].apply(lambda s: cand_join(s.tolist())).rename("dem_candidate").reset_index()
+    rep_names = dmaj[dmaj["party"] == "REPUBLICAN"].groupby(["state_po", "district"], dropna=False)["candidate"].apply(lambda s: cand_join(s.tolist())).rename("rep_candidate").reset_index()
 
     out = pv.merge(totals_all, on=["state_po", "district"], how="left")
     out = out.merge(dem_names, on=["state_po", "district"], how="left").merge(rep_names, on=["state_po", "district"], how="left")
@@ -847,25 +679,21 @@ def compute_house_district_results(house_df, year):
     for c in ["dem_pct_all", "rep_pct_all", "house_margin"]:
         out[c] = pd.to_numeric(out[c], errors="coerce").replace([np.inf, -np.inf], np.nan)
 
-    return out[
-        [
-            "state_po","district","district_id",
-            "dem_candidate","rep_candidate",
-            "dem_votes","rep_votes","total_votes_all",
-            "dem_pct_all","rep_pct_all","house_margin",
-        ]
-    ]
-
+    return out[[
+        "state_po", "district", "district_id",
+        "dem_candidate", "rep_candidate",
+        "dem_votes", "rep_votes", "total_votes_all",
+        "dem_pct_all", "rep_pct_all",
+        "house_margin"
+    ]]
 
 def compute_house_state_avg(house_df, year):
     ddf = compute_house_district_results(house_df, year)
     if ddf.empty:
         return ddf, pd.DataFrame(columns=["state_po", "avg_house_margin"])
-
     avg = ddf.groupby("state_po")["house_margin"].mean().rename("avg_house_margin").reset_index()
     avg["avg_house_margin"] = pd.to_numeric(avg["avg_house_margin"], errors="coerce").replace([np.inf, -np.inf], np.nan)
     return ddf, avg
-
 
 def attach_ratings(ddf, cook_map, sabato_map, inside_map):
     if ddf.empty:
@@ -881,43 +709,40 @@ def attach_ratings(ddf, cook_map, sabato_map, inside_map):
     )
     return d
 
+def attach_war(ddf: pd.DataFrame, war_df: pd.DataFrame, year: int) -> pd.DataFrame:
+    """
+    Merge WAR into district results for the selected year.
+    Also produces simple candidate match flags (last-name match).
+    """
+    if ddf.empty:
+        return ddf
 
-def attach_war(ddf, war_df_year: pd.DataFrame):
-    """
-    Merge WAR by district_id (and already filtered to the correct year).
-    Also add basic name-match diagnostics vs the election candidates (if present).
-    """
-    if ddf.empty or war_df_year is None or war_df_year.empty:
-        out = ddf.copy()
-        if not out.empty:
-            for c in ["war_label","war_sortable","war_democrat","war_republican","war_dem_name_match","war_rep_name_match"]:
-                if c not in out.columns:
-                    out[c] = np.nan if c == "war_sortable" else ""
-        return out
+    if war_df is None or war_df.empty:
+        ddf = ddf.copy()
+        for c in ["war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match"]:
+            ddf[c] = np.nan if c == "war_sortable" else ""
+        return ddf
+
+    w = war_df[war_df["year"] == year].copy()
+    if w.empty:
+        ddf = ddf.copy()
+        for c in ["war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match"]:
+            ddf[c] = np.nan if c == "war_sortable" else ""
+        return ddf
+
+    # de-dupe in case file has repeats
+    w = w.sort_values(["district_id"]).drop_duplicates(subset=["district_id"], keep="last")
 
     out = ddf.merge(
-        war_df_year[["district_id","war_label","war_sortable","war_democrat","war_republican"]],
+        w[["district_id", "war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate"]],
         on="district_id",
         how="left"
     )
 
-    # name match (loose)
-    if "dem_candidate" in out.columns:
-        out["war_dem_name_match"] = out.apply(lambda r: loose_name_match(r.get("dem_candidate",""), r.get("war_democrat","")), axis=1)
-    else:
-        out["war_dem_name_match"] = False
-
-    if "rep_candidate" in out.columns:
-        out["war_rep_name_match"] = out.apply(lambda r: loose_name_match(r.get("rep_candidate",""), r.get("war_republican","")), axis=1)
-    else:
-        out["war_rep_name_match"] = False
-
-    # convert bool to int for display-friendly usage if needed
-    out["war_dem_name_match"] = out["war_dem_name_match"].fillna(False).astype(bool)
-    out["war_rep_name_match"] = out["war_rep_name_match"].fillna(False).astype(bool)
-
+    # candidate match flags using last name comparison
+    out["war_dem_match"] = out.apply(lambda r: _name_match_score(str(r.get("dem_candidate", "")), str(r.get("war_dem_candidate", ""))), axis=1)
+    out["war_rep_match"] = out.apply(lambda r: _name_match_score(str(r.get("rep_candidate", "")), str(r.get("war_rep_candidate", ""))), axis=1)
     return out
-
 
 # ----------------------------
 # SHAPES (cached download + read)
@@ -930,7 +755,6 @@ def _download_cached(url, cache_path: Path):
     r.raise_for_status()
     cache_path.write_bytes(r.content)
     return cache_path
-
 
 @st.cache_data(show_spinner=True)
 def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
@@ -977,7 +801,6 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
     geojson = json.loads(gdf.to_json())
     return geojson, gdf
 
-
 # ----------------------------
 # BUILD ALL YEAR DATA ONCE
 # ----------------------------
@@ -989,22 +812,16 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path):
     ratings_union = build_ratings_union_table(cook_map, sabato_map, inside_map)
 
     spend_dist, spend_state = load_fec_spending(spend_xlsx_path)
-    war_all = load_war_by_district_year(war_csv_path)
+    war_df = load_war_by_district_year(war_csv_path)
 
     YEARS = [2016, 2018, 2020, 2022, 2024]
     year_data = {}
 
     for y in YEARS:
         pres_state = compute_pres_state_results(pres_df, pres_cand_col, y)
+
         dist_year, house_avg = compute_house_state_avg(house_df, y)
         dist_year = attach_ratings(dist_year, cook_map, sabato_map, inside_map)
-
-        # merge WAR into districts for this year
-        if war_all is not None and not war_all.empty:
-            war_y = war_all[war_all["year"] == y].copy()
-        else:
-            war_y = pd.DataFrame()
-        dist_year = attach_war(dist_year, war_y)
 
         # merge spending into districts (cycle_year == y)
         if not spend_dist.empty:
@@ -1012,6 +829,10 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path):
             sd = sd.drop(columns=["cycle_year", "state_po"], errors="ignore")
             dist_year = dist_year.merge(sd, on="district_id", how="left")
 
+        # merge WAR into districts (year == y)
+        dist_year = attach_war(dist_year, war_df, y)
+
+        # build state frame
         sdf = pres_state.merge(house_avg, on="state_po", how="outer")
 
         # merge spending into states (cycle_year == y)
@@ -1022,7 +843,7 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path):
 
         sdf = sdf.sort_values("state_po").reset_index(drop=True)
 
-        # pretty strings (pres)
+        # pretty strings (pres + house)
         if not sdf.empty:
             sdf["pres_dem_votes_str"] = sdf.get("pres_dem_votes", np.nan).map(fmt_int)
             sdf["pres_rep_votes_str"] = sdf.get("pres_rep_votes", np.nan).map(fmt_int)
@@ -1034,8 +855,8 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path):
 
             # ensure FEC cols exist
             for col in [
-                "fec_disburse_democrat","fec_disburse_republican","fec_disburse_all","fec_disburse_margin",
-                "fec_receipts_democrat","fec_receipts_republican","fec_receipts_all","fec_receipts_margin",
+                "fec_disburse_democrat", "fec_disburse_republican", "fec_disburse_all", "fec_disburse_margin",
+                "fec_receipts_democrat", "fec_receipts_republican", "fec_receipts_all", "fec_receipts_margin",
             ]:
                 if col not in sdf.columns:
                     sdf[col] = np.nan
@@ -1051,45 +872,44 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path):
             sdf["fec_receipts_margin_str"] = sdf["fec_receipts_margin"].map(fmt_pct)
 
             for c in [
-                "pres_dem_candidate","pres_rep_candidate",
-                "pres_dem_votes_str","pres_rep_votes_str","pres_total_votes_all_str",
-                "pres_dem_pct_all_str","pres_rep_pct_all_str",
-                "pres_margin_str","avg_house_margin_str",
-                "fec_disburse_democrat_str","fec_disburse_republican_str","fec_disburse_all_str","fec_disburse_margin_str",
-                "fec_receipts_democrat_str","fec_receipts_republican_str","fec_receipts_all_str","fec_receipts_margin_str",
+                "pres_dem_candidate", "pres_rep_candidate",
+                "pres_dem_votes_str", "pres_rep_votes_str", "pres_total_votes_all_str",
+                "pres_dem_pct_all_str", "pres_rep_pct_all_str",
+                "pres_margin_str", "avg_house_margin_str",
+                "fec_disburse_democrat_str", "fec_disburse_republican_str", "fec_disburse_all_str", "fec_disburse_margin_str",
+                "fec_receipts_democrat_str", "fec_receipts_republican_str", "fec_receipts_all_str", "fec_receipts_margin_str",
             ]:
                 if c in sdf.columns:
                     sdf[c] = sdf[c].fillna("").astype(str)
 
         year_data[y] = {"state_df": sdf, "dist_df": dist_year}
 
-    # Toss-up table (prefer latest year with data)
+    # Toss-up table (prefer latest year with district data)
     pref_year = 2024 if not year_data[2024]["dist_df"].empty else (2022 if not year_data[2022]["dist_df"].empty else (2020 if not year_data[2020]["dist_df"].empty else 2016))
     dist_for_toss = year_data[pref_year]["dist_df"]
 
     if not dist_for_toss.empty:
         base_cols = [
             "district_id",
-            "dem_candidate","rep_candidate",
-            "dem_votes","rep_votes","total_votes_all",
-            "dem_pct_all","rep_pct_all",
-            "Cook_2026","Sabato_2026","Inside_2026",
-            "tossup_agree_count","house_margin",
-            "war_label","war_sortable","war_democrat","war_republican","war_dem_name_match","war_rep_name_match",
+            "dem_candidate", "rep_candidate",
+            "dem_votes", "rep_votes", "total_votes_all",
+            "dem_pct_all", "rep_pct_all",
+            "Cook_2026", "Sabato_2026", "Inside_2026",
+            "tossup_agree_count", "house_margin",
+            "war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match",
         ]
         fec_cols = [c for c in dist_for_toss.columns if c.startswith("fec_")]
-        cols = base_cols + [c for c in fec_cols if c not in base_cols]
+        cols = [c for c in base_cols if c in dist_for_toss.columns] + [c for c in fec_cols if c not in base_cols]
 
         tossup_table = (
-            dist_for_toss.loc[dist_for_toss["tossup_agree_count"] > 0, [c for c in cols if c in dist_for_toss.columns]]
-            .sort_values(["tossup_agree_count","district_id"], ascending=[False, True])
+            dist_for_toss.loc[dist_for_toss["tossup_agree_count"] > 0, cols]
+            .sort_values(["tossup_agree_count", "district_id"], ascending=[False, True])
             .reset_index(drop=True)
         )
     else:
         tossup_table = pd.DataFrame()
 
     return year_data, tossup_table, ratings_union
-
 
 # ----------------------------
 # PLOTTERS
@@ -1098,7 +918,6 @@ def make_state_map_figure(sdf, year, metric_col):
     if sdf.empty:
         return None
 
-    # if pres margin missing (midterms), auto-fallback
     if metric_col == "pres_margin":
         if "pres_margin" not in sdf.columns or sdf["pres_margin"].notna().sum() == 0:
             metric_col = "avg_house_margin"
@@ -1156,11 +975,9 @@ def make_state_map_figure(sdf, year, metric_col):
     )
     return fig
 
-
 def make_district_map_figure(state_po, year, sub, spend_measure: str):
     geojson, gdf = load_state_cd_geojson(year, state_po)
 
-    # pick which spending to show
     if spend_measure == "Disbursements":
         dem_sp = "fec_disburse_democrat"
         rep_sp = "fec_disburse_republican"
@@ -1177,7 +994,7 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str):
         if c not in sub.columns:
             sub[c] = np.nan
 
-    # hover strings
+    # hover strings for spending
     sub["fec_dem_sp_str"] = sub[dem_sp].map(fmt_money)
     sub["fec_rep_sp_str"] = sub[rep_sp].map(fmt_money)
     sub["fec_all_sp_str"] = sub[all_sp].map(fmt_money)
@@ -1190,18 +1007,16 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str):
         sub["war_sortable_str"] = ""
 
     m = gdf[["district_id"]].merge(
-        sub[
-            [
-                "district_id",
-                "house_margin",
-                "dem_candidate","rep_candidate",
-                "dem_votes_str","rep_votes_str","total_votes_str",
-                "dem_pct_all_str","rep_pct_all_str",
-                "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
-                "fec_dem_sp_str","fec_rep_sp_str","fec_all_sp_str","fec_sp_margin_str",
-                "war_label","war_sortable_str","war_democrat","war_republican","war_dem_name_match","war_rep_name_match",
-            ]
-        ],
+        sub[[
+            "district_id",
+            "house_margin",
+            "dem_candidate", "rep_candidate",
+            "dem_votes_str", "rep_votes_str", "total_votes_str",
+            "dem_pct_all_str", "rep_pct_all_str",
+            "Cook_2026", "Sabato_2026", "Inside_2026", "tossup_agree_count",
+            "fec_dem_sp_str", "fec_rep_sp_str", "fec_all_sp_str", "fec_sp_margin_str",
+            "war_label", "war_sortable_str", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match",
+        ]],
         on="district_id",
         how="left",
     )
@@ -1223,7 +1038,7 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str):
         title=f"{state_po} — {year} House margin by district + 2026 ratings + FEC {spend_measure} + WAR (hover)",
         hover_data={
             "district_id": True,
-            "house_margin_plot":":.2%",
+            "house_margin_plot": ":.2%",
             "dem_candidate": True,
             "dem_votes_str": True,
             "dem_pct_all_str": True,
@@ -1241,24 +1056,21 @@ def make_district_map_figure(state_po, year, sub, spend_measure: str):
             "fec_sp_margin_str": True,
             "war_label": True,
             "war_sortable_str": True,
-            "war_democrat": True,
-            "war_republican": True,
-            "war_dem_name_match": True,
-            "war_rep_name_match": True,
+            "war_dem_candidate": True,
+            "war_rep_candidate": True,
+            "war_dem_match": True,
+            "war_rep_match": True,
         },
         scope="usa",
     )
-
     fig2.update_geos(fitbounds="locations", visible=False)
     fig2.update_layout(margin=dict(l=0, r=0, t=60, b=0), height=520)
     return fig2
-
 
 # ----------------------------
 # SIDEBAR: FILE PATHS + CONTROLS
 # ----------------------------
 st.sidebar.header("Inputs")
-
 default_pres = "1976-2024-president-extended.csv"
 default_house = "1976-2024-house (1).tab"
 default_spend = "fec_house_campaign_spending_2016_2018_2020_2022_2024.xlsx"
@@ -1295,7 +1107,6 @@ if sdf.empty:
 states = sorted([s for s in sdf["state_po"].dropna().unique().tolist() if isinstance(s, str) and len(s) == 2])
 state_po = st.sidebar.selectbox("State", states, index=0)
 
-
 # ----------------------------
 # MAIN UI
 # ----------------------------
@@ -1310,7 +1121,6 @@ with left:
 
 with right:
     st.subheader(f"{state_po} summary ({year})")
-
     row = sdf[sdf["state_po"] == state_po]
     if row.empty:
         st.info("No row for this state/year.")
@@ -1326,7 +1136,6 @@ with right:
 **Pres margin (Rep − Dem):** {r0.get("pres_margin_str","N/A")}
 """.strip()
 
-        # FEC summary
         if spend_measure == "Disbursements":
             fec_dem = r0.get("fec_disburse_democrat_str", "")
             fec_rep = r0.get("fec_disburse_republican_str", "")
@@ -1340,13 +1149,18 @@ with right:
 
         fec_block = f"""
 **FEC {spend_measure} (House candidates, state total):**
-• Dem: {fec_dem} • Rep: {fec_rep} • Total (all parties): {fec_all} • Spending margin (Rep − Dem): {fec_mar}
+• Dem: {fec_dem}
+• Rep: {fec_rep}
+• Total (all parties): {fec_all}
+• Spending margin (Rep − Dem): {fec_mar}
 """.strip()
 
         st.markdown(
             f"""
 {pres_block}
+
 **Avg House margin (Rep − Dem):** {r0.get("avg_house_margin_str","N/A")}
+
 {fec_block}
 """.strip()
         )
@@ -1390,7 +1204,7 @@ except Exception as e:
     st.warning("District map unavailable (could not load Census district shapes or plot them).")
     st.exception(e)
 
-# District table (add FEC + WAR columns)
+# District table (includes WAR + FEC)
 if spend_measure == "Disbursements":
     dem_sp = "fec_disburse_democrat"
     rep_sp = "fec_disburse_republican"
@@ -1406,55 +1220,47 @@ for c in [dem_sp, rep_sp, all_sp, mar_sp]:
     if c not in sub.columns:
         sub[c] = np.nan
 
-for c in ["war_label","war_sortable","war_democrat","war_republican","war_dem_name_match","war_rep_name_match"]:
+for c in ["war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match"]:
     if c not in sub.columns:
-        sub[c] = "" if c != "war_sortable" else np.nan
+        sub[c] = np.nan if c == "war_sortable" else ""
 
-show_cols = [
+show = sub[[
     "district_id",
-    "dem_candidate","dem_votes","dem_pct_all",
-    "rep_candidate","rep_votes","rep_pct_all",
+    "dem_candidate", "dem_votes", "dem_pct_all",
+    "rep_candidate", "rep_votes", "rep_pct_all",
     "total_votes_all",
     "house_margin",
-    "Cook_2026","Sabato_2026","Inside_2026","tossup_agree_count",
-    dem_sp, rep_sp, all_sp, mar_sp,
-    "war_label","war_sortable","war_democrat","war_republican","war_dem_name_match","war_rep_name_match",
-]
+    "Cook_2026", "Sabato_2026", "Inside_2026", "tossup_agree_count",
+    "war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match",
+    dem_sp, rep_sp, all_sp, mar_sp
+]].copy()
 
-show = sub[[c for c in show_cols if c in sub.columns]].copy()
+show["dem_votes"] = show["dem_votes"].map(fmt_int)
+show["rep_votes"] = show["rep_votes"].map(fmt_int)
+show["total_votes_all"] = show["total_votes_all"].map(fmt_int)
+show["dem_pct_all"] = show["dem_pct_all"].map(fmt_pct)
+show["rep_pct_all"] = show["rep_pct_all"].map(fmt_pct)
+show["house_margin"] = show["house_margin"].map(fmt_pct)
 
-# pretty
-for c in ["dem_votes","rep_votes","total_votes_all"]:
-    if c in show.columns:
-        show[c] = show[c].map(fmt_int)
+show["war_sortable"] = show["war_sortable"].map(lambda x: "" if pd.isna(x) else f"{float(x):.2f}")
 
-for c in ["dem_pct_all","rep_pct_all","house_margin"]:
-    if c in show.columns:
-        show[c] = show[c].map(fmt_pct)
-
-for c in [dem_sp, rep_sp, all_sp]:
-    if c in show.columns:
-        show[c] = show[c].map(fmt_money)
-
-if mar_sp in show.columns:
-    show[mar_sp] = show[mar_sp].map(fmt_pct)
-
-if "war_sortable" in show.columns:
-    show["war_sortable"] = show["war_sortable"].map(lambda x: "" if pd.isna(x) else f"{float(x):.2f}")
+show[dem_sp] = show[dem_sp].map(fmt_money)
+show[rep_sp] = show[rep_sp].map(fmt_money)
+show[all_sp] = show[all_sp].map(fmt_money)
+show[mar_sp] = show[mar_sp].map(fmt_pct)
 
 rename_map = {
     dem_sp: f"FEC {spend_measure} (Dem)",
     rep_sp: f"FEC {spend_measure} (Rep)",
     all_sp: f"FEC {spend_measure} (Total all parties)",
     mar_sp: f"FEC {spend_measure} margin (Rep−Dem)",
-    "war_label": "WAR (label)",
-    "war_sortable": "WAR (sortable)",
-    "war_democrat": "WAR Dem name",
-    "war_republican": "WAR Rep name",
-    "war_dem_name_match": "WAR Dem name matches?",
-    "war_rep_name_match": "WAR Rep name matches?",
+    "war_label": "WAR label (sheet)",
+    "war_sortable": "WAR sortable",
+    "war_dem_candidate": "WAR Democrat (sheet)",
+    "war_rep_candidate": "WAR Republican (sheet)",
+    "war_dem_match": "WAR Dem match?",
+    "war_rep_match": "WAR Rep match?",
 }
-
 st.dataframe(show.rename(columns=rename_map), use_container_width=True, height=420)
 
 # Toss-up table filtered to state
@@ -1465,10 +1271,10 @@ if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
         st.info("No toss-up districts (by your 3 sources) found for this state in the scraped tables.")
     else:
         st_toss_disp = st_toss.copy()
-        for c in ["dem_votes","rep_votes","total_votes_all"]:
+        for c in ["dem_votes", "rep_votes", "total_votes_all"]:
             if c in st_toss_disp.columns:
                 st_toss_disp[c] = st_toss_disp[c].map(fmt_int)
-        for c in ["dem_pct_all","rep_pct_all","house_margin", "fec_disburse_margin", "fec_receipts_margin"]:
+        for c in ["dem_pct_all", "rep_pct_all", "house_margin", "fec_disburse_margin", "fec_receipts_margin"]:
             if c in st_toss_disp.columns:
                 st_toss_disp[c] = st_toss_disp[c].map(fmt_pct)
         for c in st_toss_disp.columns:
@@ -1480,35 +1286,32 @@ if isinstance(tossup_table, pd.DataFrame) and not tossup_table.empty:
 else:
     st.info("No toss-up table available (ratings scrape returned no districts).")
 
-
 # ----------------------------
-# NEW: Ratings Universe view (ONLY districts mentioned by 3x 270toWin tables)
+# Ratings Universe view (ONLY districts mentioned by the 3x 270toWin tables)
 # ----------------------------
 st.divider()
 st.subheader("Ratings universe (Cook / Sabato / Inside from 270toWin) — leans / tilts / toss-ups / likely")
 
 if ratings_union is None or ratings_union.empty:
     st.info("No districts were parsed from the 270toWin rating tables.")
-    st.caption(
-        "If this suddenly went empty: 270toWin may have changed page markup. "
-        "This build uses a more flexible district regex and rating-header scan, but it still depends on the page text."
-    )
 else:
     context = year_data[year]["dist_df"].copy()
 
-    # merge ratings universe with election/FEC/WAR context for selected year
-    merge_cols = [
-        "district_id",
-        "dem_candidate","rep_candidate",
-        "dem_votes","rep_votes","total_votes_all",
-        "dem_pct_all","rep_pct_all","house_margin",
-        "tossup_agree_count",
-        "war_label","war_sortable","war_democrat","war_republican","war_dem_name_match","war_rep_name_match",
-        *[c for c in context.columns if c.startswith("fec_")],
-    ]
-    merge_cols = [c for c in merge_cols if c in context.columns]
-
-    merged = ratings_union.merge(context[merge_cols], on="district_id", how="left")
+    # merge union -> context (includes WAR because we attached it into dist_df)
+    merged = ratings_union.merge(
+        context[[
+            "district_id",
+            "dem_candidate", "rep_candidate",
+            "dem_votes", "rep_votes", "total_votes_all",
+            "dem_pct_all", "rep_pct_all",
+            "house_margin",
+            "tossup_agree_count",
+            "war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match",
+            *[c for c in context.columns if c.startswith("fec_")]
+        ]],
+        on="district_id",
+        how="left"
+    )
 
     c1, c2, c3, c4 = st.columns([1.1, 1.0, 1.0, 1.3])
     with c1:
@@ -1533,44 +1336,42 @@ else:
         view = view[view["side_agree_max"] < view["mentioned_by_count"]]
 
     # formatting
-    for c in ["dem_votes","rep_votes","total_votes_all"]:
+    for c in ["dem_votes", "rep_votes", "total_votes_all"]:
         if c in view.columns:
             view[c] = view[c].map(fmt_int)
-    for c in ["dem_pct_all","rep_pct_all","house_margin"]:
+    for c in ["dem_pct_all", "rep_pct_all", "house_margin"]:
         if c in view.columns:
             view[c] = view[c].map(fmt_pct)
+
+    if "war_sortable" in view.columns:
+        view["war_sortable"] = view["war_sortable"].map(lambda x: "" if pd.isna(x) else f"{float(x):.2f}")
+
     for c in view.columns:
         if c.startswith("fec_") and ("disburse" in c or "receipts" in c) and not c.endswith("margin"):
             view[c] = view[c].map(fmt_money)
         if c.startswith("fec_") and c.endswith("margin"):
             view[c] = view[c].map(fmt_pct)
 
-    if "war_sortable" in view.columns:
-        view["war_sortable"] = view["war_sortable"].map(lambda x: "" if pd.isna(x) else f"{float(x):.2f}")
-
-    # sort: most widely mentioned, then most disagreement, then most “competitive”
+    # sort
     view["_disagree"] = (view["side_agree_max"] < view["mentioned_by_count"]).astype(int)
-    view = (
-        view.sort_values(
-            by=["mentioned_by_count","_disagree","any_tossup_or_tilt","district_id"],
-            ascending=[False, False, False, True],
-        )
-        .drop(columns=["_disagree"], errors="ignore")
-    )
+    view = view.sort_values(
+        by=["mentioned_by_count", "_disagree", "any_tossup_or_tilt", "district_id"],
+        ascending=[False, False, False, True],
+    ).drop(columns=["_disagree"], errors="ignore")
 
     core_cols = [
         "district_id",
-        "Cook_2026","Sabato_2026","Inside_2026",
-        "mentioned_by_count","side_agree_max","exact_label_agree_max",
-        "consensus_by_avgscore","avg_score",
-        "dem_candidate","rep_candidate","house_margin",
-        "war_label","war_sortable","war_democrat","war_republican","war_dem_name_match","war_rep_name_match",
+        "Cook_2026", "Sabato_2026", "Inside_2026",
+        "mentioned_by_count", "side_agree_max", "exact_label_agree_max",
+        "consensus_by_avgscore", "avg_score",
+        "dem_candidate", "rep_candidate", "house_margin",
+        "war_label", "war_sortable", "war_dem_candidate", "war_rep_candidate", "war_dem_match", "war_rep_match",
     ]
 
     if spend_measure == "Disbursements":
-        fec_cols = ["fec_disburse_democrat","fec_disburse_republican","fec_disburse_all","fec_disburse_margin"]
+        fec_cols = ["fec_disburse_democrat", "fec_disburse_republican", "fec_disburse_all", "fec_disburse_margin"]
     else:
-        fec_cols = ["fec_receipts_democrat","fec_receipts_republican","fec_receipts_all","fec_receipts_margin"]
+        fec_cols = ["fec_receipts_democrat", "fec_receipts_republican", "fec_receipts_all", "fec_receipts_margin"]
 
     show_cols = [c for c in core_cols if c in view.columns] + [c for c in fec_cols if c in view.columns]
 
@@ -1580,12 +1381,6 @@ else:
         "exact_label_agree_max": "Exact label agree (max)",
         "consensus_by_avgscore": "Consensus (avg score)",
         "avg_score": "Avg score (Dem - / Rep +)",
-        "war_label": "WAR (label)",
-        "war_sortable": "WAR (sortable)",
-        "war_democrat": "WAR Dem name",
-        "war_republican": "WAR Rep name",
-        "war_dem_name_match": "WAR Dem name matches?",
-        "war_rep_name_match": "WAR Rep name matches?",
         "fec_disburse_democrat": "FEC Disburse (Dem)",
         "fec_disburse_republican": "FEC Disburse (Rep)",
         "fec_disburse_all": "FEC Disburse (All parties)",
@@ -1594,19 +1389,24 @@ else:
         "fec_receipts_republican": "FEC Receipts (Rep)",
         "fec_receipts_all": "FEC Receipts (All parties)",
         "fec_receipts_margin": "FEC Receipts margin (Rep−Dem)",
+        "war_label": "WAR label (sheet)",
+        "war_sortable": "WAR sortable",
+        "war_dem_candidate": "WAR Democrat (sheet)",
+        "war_rep_candidate": "WAR Republican (sheet)",
+        "war_dem_match": "WAR Dem match?",
+        "war_rep_match": "WAR Rep match?",
     }
 
     st.dataframe(view[show_cols].rename(columns=rename), use_container_width=True, height=520)
 
-# warnings for missing files
-if spend_path and not Path(spend_path).exists():
-    st.warning("FEC spending XLSX path not found. Add the file to the repo (same folder as app.py) or correct the path.")
-if war_path and not Path(war_path).exists():
-    st.warning("WAR CSV path not found. Add the WAR file to the repo (same folder as app.py) or correct the path.")
+    if spend_path and not Path(spend_path).exists():
+        st.warning("FEC spending XLSX path not found. Add the file to the repo (same folder as app.py) or correct the path.")
+    if war_path and not Path(war_path).exists():
+        st.warning("WAR CSV path not found. Add the file to the repo (same folder as app.py) or correct the path.")
 
 st.caption(
     "Notes: Presidential stats only exist for presidential years (2016/2020/2024); midterms show House + FEC spending. "
     "Ratings are scraped ONLY from the 3x 270toWin tables (Cook/Sabato/Inside). "
-    "WAR is merged by district_id + year and includes a simple name-match check vs election candidates. "
+    "WAR is merged from your CSV using Geography -> district_id normalization (handles missing leading zeros). "
     "District shapes are cached locally."
 )
