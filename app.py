@@ -5,17 +5,12 @@
 # - District hover includes House results + 2026 ratings + optional FEC + optional ACS demographics
 # - Ratings Universe view (Cook/Sabato/Inside from 3x 270toWin URLs ONLY)
 # - WAR merge-in from your uploaded CSV (per district/year)
-# - ACS (American Community Survey) 5-year *Data Profile* via Census Data API:
-#   * District-level via “congressional district”
-#   * State-level via “state”
-#   * Fields (excluding relig/union): race, gender, income, education, age, veteran
 #
-# FIXES in this version:
-# 1) District shapes: robustly finds CD FP column (handles CD116FP/CD118FP and other variants)
-# 2) ACS race % wrong: STOP hardcoding DP05_xxxx codes.
-#    Instead, dynamically resolve the correct variable codes by LABEL from variables.json
-#    (DP05 changes across years; labels are what you actually want.)
-# 3) ACS % formatting: safe normalization (handles 0-1 vs 0-100 vs 0-10000 mistakes)
+# ACS FIX (IMPORTANT):
+# - STOP using /acs/acs5/profile (Data Profile) because it can 404 for newer years and is label/code-shifty.
+# - USE /acs/acs5 (detailed tables) with stable B-table variable codes.
+# - Compute percentages ourselves.
+# - ALWAYS create ACS columns even if API fails, so your tables never "lose" ACS columns.
 # ============================================
 
 import re, json
@@ -109,11 +104,11 @@ def fmt_float(x, nd=2):
 
 def _pct_to_ratio(x):
     """
-    Convert a Census 'percent-ish' value to a 0..1 ratio robustly.
+    Convert a 'percent-ish' value to a 0..1 ratio robustly.
     Handles:
       - already ratio (0.0..1.0)
       - percent (0..100)
-      - weirdly scaled (0..10000) from accidental *100 or API quirks
+      - weirdly scaled (0..10000) from accidental *100
     """
     try:
         if pd.isna(x):
@@ -122,14 +117,11 @@ def _pct_to_ratio(x):
         if not np.isfinite(v):
             return np.nan
         av = abs(v)
-        # If it's huge, keep dividing by 100 until it's plausibly <=100
         while av > 100.0:
             v /= 100.0
             av = abs(v)
-        # Now if it's 0..100, convert to ratio
         if av > 1.0:
             v /= 100.0
-        # final sanity clamp (don’t hard clip too aggressively)
         return v
     except Exception:
         return np.nan
@@ -212,7 +204,6 @@ def party_simple_from_fec(party_str: str):
     return ""
 
 def district_code_to_id(code: str):
-    # examples: "AL-01", "VT-00", sometimes "DC-00"
     s = (code or "").strip().upper()
     m = re.match(r"^([A-Z]{2})-(\d{1,2}|00|AL)$", s)
     if not m:
@@ -515,12 +506,12 @@ def load_war_by_district_year(war_csv_path: str) -> pd.DataFrame:
     return out[["district_id", "year", "war_str", "war_sortable", "war_dem_candidate", "war_rep_candidate"]]
 
 # ----------------------------
-# ACS (Census Data API) - district + state
-#   FIX: resolve variables by LABEL (DP tables shift across years)
+# ACS (Census Data API) - ROBUST VERSION
+# Uses /acs/acs5 "detailed tables" with stable variable codes.
+# Computes percentages ourselves and keeps ACS columns present even if ACS fetch fails.
 # ----------------------------
 CENSUS_API_BASE = "https://api.census.gov/data"
 
-# logical output columns we want
 ACS_OUTPUT_COLS = [
     "acs_total_pop",
     "acs_pct_male",
@@ -535,205 +526,74 @@ ACS_OUTPUT_COLS = [
     "acs_pct_veteran",
 ]
 
+ACS5_VARS = {
+    "tot_pop": "B01001_001E",
+    "male": "B01001_002E",
+    "female": "B01001_026E",
+    "median_age": "B01002_001E",
+    "white": "B02001_002E",
+    "black": "B02001_003E",
+    "asian": "B02001_005E",
+    "hisp": "B03003_003E",
+    "hisp_total": "B03003_001E",
+    "med_hh_inc": "B19013_001E",
+    "edu_total_25": "B15003_001E",
+    "edu_bach": "B15003_022E",
+    "edu_mast": "B15003_023E",
+    "edu_prof": "B15003_024E",
+    "edu_doc": "B15003_025E",
+    "vet_total_18": "B21001_001E",
+    "vet_yes": "B21001_002E",
+}
+
+def _append_key(url: str, api_key):
+    if api_key and str(api_key).strip():
+        join = "&" if "?" in url else "?"
+        return url + f"{join}key={str(api_key).strip()}"
+    return url
+
 def _census_get(url: str, timeout=40):
     r = requests.get(url, headers=UA, timeout=timeout)
     if r.status_code != 200:
         raise RuntimeError(f"Census API HTTP {r.status_code}: {r.text[:500]}")
     return r.json()
 
-@st.cache_data(show_spinner=False, ttl=24*60*60)
-def load_acs_variables_meta(acs_year: int) -> dict:
-    """
-    Returns variables.json as a dict for the DP profile endpoint.
-    """
-    url = f"{CENSUS_API_BASE}/{acs_year}/acs/acs5/profile/variables.json"
-    r = requests.get(url, headers=UA, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"variables.json HTTP {r.status_code}: {r.text[:300]}")
-    j = r.json()
-    return j.get("variables", {})
-
-def _pick_var_code(vars_meta: dict, wants_percent: bool, include_tokens, exclude_tokens):
-    """
-    Select the "best" code for a desired concept by label tokens.
-    - Filters out margin-of-error / annotations.
-    - For percent fields, prefers codes ending in 'PE'.
-    - For estimates, prefers codes ending in 'E' (not 'M', not annotations).
-    """
-    include_tokens = [t.lower() for t in include_tokens if t]
-    exclude_tokens = [t.lower() for t in (exclude_tokens or []) if t]
-
-    candidates = []
-    for code, meta in vars_meta.items():
-        lab = str(meta.get("label", "")).lower()
-
-        # hard excludes
-        if "margin of error" in lab or lab.startswith("annotation"):
-            continue
-        if "annotation" in lab:
-            continue
-
-        # only numeric estimate codes
-        if wants_percent:
-            if not code.endswith("PE"):
-                continue
-        else:
-            # Estimate codes usually end with E, but exclude percent-estimates PE
-            if not code.endswith("E") or code.endswith("PE"):
-                continue
-
-        ok = True
-        for t in include_tokens:
-            if t not in lab:
-                ok = False
-                break
-        if not ok:
-            continue
-        for t in exclude_tokens:
-            if t in lab:
-                ok = False
-                break
-        if not ok:
-            continue
-
-        # scoring heuristic: shorter labels tend to be "direct" (not deep subcategories),
-        # and prefer 'alone' over 'in combination' for race if we asked for alone
-        score = 0
-        score += max(0, 200 - len(lab))
-        if "alone" in lab:
-            score += 20
-        if "in combination" in lab:
-            score -= 60
-        candidates.append((score, code, lab))
-
-    if not candidates:
-        return None
-    candidates.sort(reverse=True, key=lambda x: x[0])
-    return candidates[0][1]
-
-@st.cache_data(show_spinner=True, ttl=24*60*60)
-def resolve_acs_profile_varmap(acs_year: int):
-    """
-    Returns (varmap, notes)
-      varmap: dict logical_name -> variable_code
-      notes: list[str] describing what matched (debuggable)
-    """
-    vars_meta = load_acs_variables_meta(acs_year)
+def _acs_notes(year: int) -> list[str]:
     notes = []
-    varmap = {}
-
-    # Total pop (estimate)
-    # We accept several label wordings across years.
-    total_code = None
-    for inc in [
-        ["estimate", "total population"],
-        ["estimate", "sex and age", "total population"],
-        ["estimate", "population", "total population"],
-    ]:
-        total_code = _pick_var_code(vars_meta, wants_percent=False, include_tokens=inc, exclude_tokens=["percent"])
-        if total_code:
-            break
-    varmap["acs_total_pop"] = total_code
-
-    # Male/Female percent
-    varmap["acs_pct_male"] = (
-        _pick_var_code(vars_meta, True, ["percent", "male"], ["margin of error"])
-        or _pick_var_code(vars_meta, True, ["percent", "sex and age", "male"], [])
-    )
-    varmap["acs_pct_female"] = (
-        _pick_var_code(vars_meta, True, ["percent", "female"], ["margin of error"])
-        or _pick_var_code(vars_meta, True, ["percent", "sex and age", "female"], [])
-    )
-
-    # Median age (estimate)
-    varmap["acs_median_age"] = (
-        _pick_var_code(vars_meta, False, ["median age"], [])
-        or _pick_var_code(vars_meta, False, ["estimate", "median age"], [])
-    )
-
-    # Race percents (prefer “alone”, exclude “in combination” and exclude “not hispanic” for the race lines)
-    varmap["acs_pct_white_alone"] = (
-        _pick_var_code(vars_meta, True, ["percent", "white alone"], ["in combination", "not hispanic"])
-        or _pick_var_code(vars_meta, True, ["percent", "race", "white alone"], ["in combination", "not hispanic"])
-        or _pick_var_code(vars_meta, True, ["percent", "white"], ["in combination", "not hispanic"])  # fallback
-    )
-    varmap["acs_pct_black_alone"] = (
-        _pick_var_code(vars_meta, True, ["percent", "black or african american alone"], ["in combination", "not hispanic"])
-        or _pick_var_code(vars_meta, True, ["percent", "black alone"], ["in combination", "not hispanic"])
-        or _pick_var_code(vars_meta, True, ["percent", "black or african american"], ["in combination", "not hispanic"])
-    )
-    varmap["acs_pct_asian_alone"] = (
-        _pick_var_code(vars_meta, True, ["percent", "asian alone"], ["in combination", "not hispanic"])
-        or _pick_var_code(vars_meta, True, ["percent", "asian"], ["in combination", "not hispanic"])
-    )
-
-    # Hispanic percent (this is “of any race”, so do NOT require “alone”)
-    varmap["acs_pct_hispanic"] = (
-        _pick_var_code(vars_meta, True, ["percent", "hispanic or latino"], ["not hispanic"])
-        or _pick_var_code(vars_meta, True, ["percent", "hispanic"], ["not hispanic"])
-    )
-
-    # Median household income (estimate)
-    varmap["acs_median_hh_income"] = (
-        _pick_var_code(vars_meta, False, ["median household income"], ["margin of error"])
-        or _pick_var_code(vars_meta, False, ["estimate", "median household income"], [])
-    )
-
-    # Bachelor+ (percent; usually 25+)
-    varmap["acs_pct_bachelors_or_higher"] = (
-        _pick_var_code(vars_meta, True, ["percent", "bachelor", "higher"], [])
-        or _pick_var_code(vars_meta, True, ["percent", "bachelor"], [])
-        or _pick_var_code(vars_meta, True, ["percent", "education", "bachelor"], [])
-    )
-
-    # Veteran percent (percent; typically "civilian population 18 years and over")
-    varmap["acs_pct_veteran"] = (
-        _pick_var_code(vars_meta, True, ["percent", "veteran"], [])
-        or _pick_var_code(vars_meta, True, ["percent", "civilian population 18 years and over", "veteran"], [])
-    )
-
-    # Notes
-    for k in ACS_OUTPUT_COLS:
-        c = varmap.get(k)
-        if c:
-            notes.append(f"{k} -> {c}")
-        else:
-            notes.append(f"{k} -> (NOT FOUND)")
-
-    return varmap, notes
-
-def _append_key(url: str, api_key: str | None):
-    if api_key and str(api_key).strip():
-        join = "&" if "?" in url else "?"
-        return url + f"{join}key={str(api_key).strip()}"
-    return url
+    notes.append(f"ACS source: {year}/acs/acs5 (detailed tables)")
+    for k, v in ACS5_VARS.items():
+        notes.append(f"{k} -> {v}")
+    notes.append("Derived:")
+    notes.append("  acs_pct_male = B01001_002E / B01001_001E")
+    notes.append("  acs_pct_female = B01001_026E / B01001_001E")
+    notes.append("  acs_pct_white_alone = B02001_002E / B01001_001E")
+    notes.append("  acs_pct_black_alone = B02001_003E / B01001_001E")
+    notes.append("  acs_pct_asian_alone = B02001_005E / B01001_001E")
+    notes.append("  acs_pct_hispanic = B03003_003E / B03003_001E")
+    notes.append("  acs_pct_bachelors_or_higher = (B15003_022E+023E+024E+025E) / B15003_001E")
+    notes.append("  acs_pct_veteran = B21001_002E / B21001_001E")
+    return notes
 
 @st.cache_data(show_spinner=True, ttl=24*60*60)
-def load_acs_profile_congressional_district(acs_year: int, api_key: str | None) -> tuple[pd.DataFrame, list[str]]:
-    varmap, notes = resolve_acs_profile_varmap(acs_year)
-    codes = [varmap.get(k) for k in ACS_OUTPUT_COLS if varmap.get(k)]
-    if not codes:
-        return pd.DataFrame(), notes
-
-    get_expr = "NAME," + ",".join(codes)
+def load_acs_acs5_congressional_district(acs_year: int, api_key) -> tuple[pd.DataFrame, list[str]]:
+    var_list = ",".join(ACS5_VARS.values())
+    get_expr = "NAME," + var_list
     url = (
-        f"{CENSUS_API_BASE}/{acs_year}/acs/acs5/profile"
+        f"{CENSUS_API_BASE}/{acs_year}/acs/acs5"
         f"?get={get_expr}&for=congressional%20district:*&in=state:*"
     )
     url = _append_key(url, api_key)
-    data = _census_get(url)
 
+    data = _census_get(url)
     if not data or len(data) < 2:
-        return pd.DataFrame(), notes
+        return pd.DataFrame(), _acs_notes(acs_year)
 
     header = data[0]
     rows = data[1:]
     df = pd.DataFrame(rows, columns=header)
 
-    # normalize keys
     df["state"] = df["state"].astype(str).str.zfill(2)
     df["congressional district"] = df["congressional district"].astype(str).str.zfill(2)
-
     df["state_po"] = df["state"].map(FIPS_TO_STATE).fillna("")
 
     def mk_did(row):
@@ -749,31 +609,58 @@ def load_acs_profile_congressional_district(acs_year: int, api_key: str | None) 
     df["district_id"] = df.apply(mk_did, axis=1)
     df = df[df["district_id"].astype(str).str.len() > 0].copy()
 
-    # create output columns using the resolved codes
-    out = df[["district_id", "state_po"]].copy()
-    for logical in ACS_OUTPUT_COLS:
-        code = varmap.get(logical)
-        if code and code in df.columns:
-            out[logical] = pd.to_numeric(df[code], errors="coerce")
+    for _, code in ACS5_VARS.items():
+        if code in df.columns:
+            df[code] = pd.to_numeric(df[code], errors="coerce")
         else:
-            out[logical] = np.nan
+            df[code] = np.nan
 
-    return out, notes
+    out = df[["district_id", "state_po"]].copy()
+
+    tot = df[ACS5_VARS["tot_pop"]]
+    out["acs_total_pop"] = tot
+    out["acs_pct_male"] = df[ACS5_VARS["male"]] / tot.replace(0, np.nan)
+    out["acs_pct_female"] = df[ACS5_VARS["female"]] / tot.replace(0, np.nan)
+    out["acs_median_age"] = df[ACS5_VARS["median_age"]]
+
+    out["acs_pct_white_alone"] = df[ACS5_VARS["white"]] / tot.replace(0, np.nan)
+    out["acs_pct_black_alone"] = df[ACS5_VARS["black"]] / tot.replace(0, np.nan)
+    out["acs_pct_asian_alone"] = df[ACS5_VARS["asian"]] / tot.replace(0, np.nan)
+
+    hisp_den = df[ACS5_VARS["hisp_total"]].replace(0, np.nan)
+    out["acs_pct_hispanic"] = df[ACS5_VARS["hisp"]] / hisp_den
+
+    out["acs_median_hh_income"] = df[ACS5_VARS["med_hh_inc"]]
+
+    edu_den = df[ACS5_VARS["edu_total_25"]].replace(0, np.nan)
+    edu_num = (
+        df[ACS5_VARS["edu_bach"]]
+        + df[ACS5_VARS["edu_mast"]]
+        + df[ACS5_VARS["edu_prof"]]
+        + df[ACS5_VARS["edu_doc"]]
+    )
+    out["acs_pct_bachelors_or_higher"] = edu_num / edu_den
+
+    vet_den = df[ACS5_VARS["vet_total_18"]].replace(0, np.nan)
+    out["acs_pct_veteran"] = df[ACS5_VARS["vet_yes"]] / vet_den
+
+    # guarantee columns exist
+    for c in ACS_OUTPUT_COLS:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    return out, _acs_notes(acs_year)
 
 @st.cache_data(show_spinner=True, ttl=24*60*60)
-def load_acs_profile_state(acs_year: int, api_key: str | None) -> tuple[pd.DataFrame, list[str]]:
-    varmap, notes = resolve_acs_profile_varmap(acs_year)
-    codes = [varmap.get(k) for k in ACS_OUTPUT_COLS if varmap.get(k)]
-    if not codes:
-        return pd.DataFrame(), notes
-
-    get_expr = "NAME," + ",".join(codes)
-    url = f"{CENSUS_API_BASE}/{acs_year}/acs/acs5/profile?get={get_expr}&for=state:*"
+def load_acs_acs5_state(acs_year: int, api_key) -> tuple[pd.DataFrame, list[str]]:
+    var_list = ",".join(ACS5_VARS.values())
+    get_expr = "NAME," + var_list
+    url = f"{CENSUS_API_BASE}/{acs_year}/acs/acs5?get={get_expr}&for=state:*"
     url = _append_key(url, api_key)
-    data = _census_get(url)
 
+    data = _census_get(url)
     if not data or len(data) < 2:
-        return pd.DataFrame(), notes
+        return pd.DataFrame(), _acs_notes(acs_year)
 
     header = data[0]
     rows = data[1:]
@@ -781,19 +668,50 @@ def load_acs_profile_state(acs_year: int, api_key: str | None) -> tuple[pd.DataF
 
     df["state"] = df["state"].astype(str).str.zfill(2)
     df["state_po"] = df["state"].map(FIPS_TO_STATE).fillna("")
+    df = df[df["state_po"].astype(str).str.len() == 2].copy()
+
+    for _, code in ACS5_VARS.items():
+        if code in df.columns:
+            df[code] = pd.to_numeric(df[code], errors="coerce")
+        else:
+            df[code] = np.nan
 
     out = df[["state_po"]].copy()
-    for logical in ACS_OUTPUT_COLS:
-        code = varmap.get(logical)
-        if code and code in df.columns:
-            out[logical] = pd.to_numeric(df[code], errors="coerce")
-        else:
-            out[logical] = np.nan
 
-    out = out[out["state_po"].astype(str).str.len() == 2].copy()
-    return out, notes
+    tot = df[ACS5_VARS["tot_pop"]]
+    out["acs_total_pop"] = tot
+    out["acs_pct_male"] = df[ACS5_VARS["male"]] / tot.replace(0, np.nan)
+    out["acs_pct_female"] = df[ACS5_VARS["female"]] / tot.replace(0, np.nan)
+    out["acs_median_age"] = df[ACS5_VARS["median_age"]]
 
-def load_acs_with_fallback(requested_year: int, api_key: str | None):
+    out["acs_pct_white_alone"] = df[ACS5_VARS["white"]] / tot.replace(0, np.nan)
+    out["acs_pct_black_alone"] = df[ACS5_VARS["black"]] / tot.replace(0, np.nan)
+    out["acs_pct_asian_alone"] = df[ACS5_VARS["asian"]] / tot.replace(0, np.nan)
+
+    hisp_den = df[ACS5_VARS["hisp_total"]].replace(0, np.nan)
+    out["acs_pct_hispanic"] = df[ACS5_VARS["hisp"]] / hisp_den
+
+    out["acs_median_hh_income"] = df[ACS5_VARS["med_hh_inc"]]
+
+    edu_den = df[ACS5_VARS["edu_total_25"]].replace(0, np.nan)
+    edu_num = (
+        df[ACS5_VARS["edu_bach"]]
+        + df[ACS5_VARS["edu_mast"]]
+        + df[ACS5_VARS["edu_prof"]]
+        + df[ACS5_VARS["edu_doc"]]
+    )
+    out["acs_pct_bachelors_or_higher"] = edu_num / edu_den
+
+    vet_den = df[ACS5_VARS["vet_total_18"]].replace(0, np.nan)
+    out["acs_pct_veteran"] = df[ACS5_VARS["vet_yes"]] / vet_den
+
+    for c in ACS_OUTPUT_COLS:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    return out, _acs_notes(acs_year)
+
+def load_acs_with_fallback(requested_year: int, api_key):
     """
     Try requested_year, then requested_year-1, then requested_year-2.
     Returns:
@@ -807,17 +725,14 @@ def load_acs_with_fallback(requested_year: int, api_key: str | None):
             continue
         tried.append(y)
         try:
-            cd, cd_notes = load_acs_profile_congressional_district(y, api_key)
-            stt, st_notes = load_acs_profile_state(y, api_key)
-            var_notes = cd_notes  # same resolver per year
+            cd, notes = load_acs_acs5_congressional_district(y, api_key)
+            stt, _ = load_acs_acs5_state(y, api_key)
+            var_notes = notes
             if not cd.empty and not stt.empty:
                 return y, cd, stt, tried, errors, var_notes
-            else:
-                errors[y] = f"Empty response (cd_rows={len(cd)}, state_rows={len(stt)})"
+            errors[y] = f"Empty response (cd_rows={len(cd)}, state_rows={len(stt)})"
         except Exception as e:
             errors[y] = repr(e)
-            continue
-
     return requested_year, pd.DataFrame(), pd.DataFrame(), tried, errors, var_notes
 
 # ----------------------------
@@ -960,16 +875,13 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
 
     gdf = gpd.read_file(f"zip://{zip_path}")
 
-    # FIX: robust CD column detection
     cols_upper = {str(c).upper(): c for c in gdf.columns}
     cd_candidates = []
     for u, orig in cols_upper.items():
         if u.startswith("CD") and u.endswith("FP"):
             cd_candidates.append(orig)
     if not cd_candidates:
-        # last resort: regex
         cd_candidates = [c for c in gdf.columns if re.match(r"^CD\d+FP$", str(c).strip(), flags=re.I)]
-
     if not cd_candidates:
         raise ValueError(f"Could not find district FP column. Columns: {list(gdf.columns)}")
     cd_col = cd_candidates[0]
@@ -1001,7 +913,7 @@ def load_state_cd_geojson(year, state_po, cache_dir="district_shapes_cache"):
 # ----------------------------
 @st.cache_data(show_spinner=True)
 def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
-                    enable_acs: bool, acs_requested_year: int, census_api_key: str | None):
+                    enable_acs: bool, acs_requested_year: int, census_api_key):
     pres_df, pres_cand_col, house_df = load_inputs(pres_path, house_path)
     cook_map, sabato_map, inside_map = get_2026_ratings_maps()
     ratings_union = build_ratings_union_table(cook_map, sabato_map, inside_map)
@@ -1034,6 +946,12 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
                 how="left"
             )
 
+        # ALWAYS keep ACS columns present
+        if enable_acs:
+            for c in ACS_OUTPUT_COLS:
+                if c not in dist_year.columns:
+                    dist_year[c] = np.nan
+
         # merge spending into districts (cycle_year == y)
         if not spend_dist.empty:
             sd = spend_dist[spend_dist["cycle_year"] == y].copy()
@@ -1052,6 +970,12 @@ def build_year_data(pres_path, house_path, spend_xlsx_path, war_csv_path,
         # merge ACS state-level
         if enable_acs and not acs_state.empty:
             sdf = sdf.merge(acs_state, on="state_po", how="left")
+
+        # ALWAYS keep ACS columns present in state df
+        if enable_acs:
+            for c in ACS_OUTPUT_COLS:
+                if c not in sdf.columns:
+                    sdf[c] = np.nan
 
         sdf = sdf.sort_values("state_po").reset_index(drop=True)
 
@@ -1333,7 +1257,7 @@ war_path = st.sidebar.text_input("WAR CSV path", value=default_war)
 st.sidebar.divider()
 
 YEARS = [2016, 2018, 2020, 2022, 2024]
-year = st.sidebar.radio("Year", YEARS, index=0)
+year = st.sidebar.radio("Year", YEARS, index=YEARS.index(2024))
 metric_label = st.sidebar.radio("State map colors", ["Pres margin", "Avg House margin"], index=0)
 metric_col = "pres_margin" if metric_label == "Pres margin" else "avg_house_margin"
 
@@ -1344,7 +1268,7 @@ st.sidebar.subheader("ACS (Census API)")
 
 enable_acs = st.sidebar.checkbox("Enable ACS demographics (Census API)", value=True)
 acs_requested_year = st.sidebar.number_input(
-    "ACS 5-year Profile year (try 2024; auto-fallback)",
+    "ACS 5-year (acs/acs5) year (try 2024; auto-fallback)",
     min_value=2010, max_value=2030, value=2024, step=1,
     disabled=(not enable_acs),
 )
@@ -1379,7 +1303,7 @@ if enable_acs:
         with st.sidebar.expander("ACS errors (if any)"):
             for k, v in acs_errors.items():
                 st.write(f"{k}: {v}")
-    with st.sidebar.expander("ACS variables resolved (debug)"):
+    with st.sidebar.expander("ACS variables / derivations (debug)"):
         for line in (acs_var_notes or []):
             st.write(line)
 
@@ -1389,7 +1313,7 @@ if sdf.empty:
     st.stop()
 
 states = sorted([s for s in sdf["state_po"].dropna().unique().tolist() if isinstance(s, str) and len(s)==2])
-state_po = st.sidebar.selectbox("State", states, index=0)
+state_po = st.sidebar.selectbox("State", states, index=max(0, states.index("AR")) if "AR" in states else 0)
 
 # ----------------------------
 # MAIN UI
@@ -1440,7 +1364,7 @@ with right:
         acs_block = ""
         if enable_acs and ("acs_median_hh_income_str" in sdf.columns or "acs_pct_bachelors_or_higher_str" in sdf.columns):
             acs_block = f"""
-**ACS (5-year Data Profile, state):**
+**ACS (ACS5 detailed tables, state):**
 • Median HH income: {r0.get("acs_median_hh_income_str","")}
 • Median age: {r0.get("acs_median_age_str","")}
 • % Bachelor+ (25+): {r0.get("acs_pct_bachelors_or_higher_str","")}
@@ -1511,6 +1435,7 @@ for c in [dem_sp, rep_sp, all_sp, mar_sp]:
     if c not in sub.columns:
         sub[c] = np.nan
 
+# ACS columns should ALWAYS exist when enable_acs True (guaranteed earlier), but keep this safe anyway
 acs_cols = [c for c in ACS_OUTPUT_COLS if c in sub.columns] if enable_acs else []
 
 show_cols = [
@@ -1774,9 +1699,10 @@ if enable_acs:
         "Notes: Presidential stats only exist for presidential years (2016/2020/2024); midterms show House + FEC spending. "
         "Ratings are scraped ONLY from the 3x 270toWin tables (Cook/Sabato/Inside). "
         "District shapes are cached locally. "
-        f"ACS demographics come from the U.S. Census Bureau ACS 5-year *Data Profile* via the Census Data API "
+        f"ACS demographics come from the U.S. Census Bureau ACS 5-year via the Census Data API using the stable "
+        f"'acs/acs5' detailed tables endpoint "
         f"(requested {acs_requested_year}; used {acs_used_year}; tried {acs_tried}). "
-        "IMPORTANT: DP05 variable *codes* change across years; this app resolves the correct variables by LABEL each run/year."
+        "Race and Hispanic are computed correctly: Hispanic is 'of any race' and can overlap with White/Black/Asian."
     )
 else:
     st.caption(
