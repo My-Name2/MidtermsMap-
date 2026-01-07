@@ -471,14 +471,25 @@ def load_fec_spending(spend_xlsx_path: str):
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    dist_all = df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]].sum().reset_index()
-    dist_all = dist_all.rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
+    # District totals across all parties
+    dist_all = (
+        df.groupby(["cycle_year", "state_po", "district_id"], dropna=False)[["receipts", "disbursements"]]
+          .sum()
+          .reset_index()
+          .rename(columns={"receipts": "fec_receipts_all", "disbursements": "fec_disburse_all"})
+    )
 
+    # District totals for Dem/Rep only
     maj = df[df["party_simple"].isin(["DEMOCRAT", "REPUBLICAN"])].copy()
     if maj.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    dist_party = maj.groupby(["cycle_year", "state_po", "district_id", "party_simple"])[["receipts", "disbursements"]].sum().reset_index()
+    dist_party = (
+        maj.groupby(["cycle_year", "state_po", "district_id", "party_simple"])[["receipts", "disbursements"]]
+           .sum()
+           .reset_index()
+    )
+
     piv = dist_party.pivot_table(
         index=["cycle_year", "state_po", "district_id"],
         columns="party_simple",
@@ -490,28 +501,50 @@ def load_fec_spending(spend_xlsx_path: str):
     piv = piv.reset_index()
 
     spend_dist = piv.merge(dist_all, on=["cycle_year", "state_po", "district_id"], how="left")
+
+    # Ensure expected columns exist even if one party is missing in a district
     for c in ["fec_receipts_democrat", "fec_receipts_republican", "fec_disburse_democrat", "fec_disburse_republican"]:
         if c not in spend_dist.columns:
             spend_dist[c] = 0.0
 
     spend_dist["fec_receipts_maj_total"] = spend_dist["fec_receipts_democrat"] + spend_dist["fec_receipts_republican"]
-    spend_dist["fec_receipts_margin"] = (spend_dist["fec_receipts_republican"] - spend_dist["fec_receipts_democrat"]) / spend_dist["fec_receipts_maj_total"].replace(0, np.nan)
+    spend_dist["fec_receipts_margin"] = (
+        (spend_dist["fec_receipts_republican"] - spend_dist["fec_receipts_democrat"])
+        / spend_dist["fec_receipts_maj_total"].replace(0, np.nan)
+    )
 
     spend_dist["fec_disburse_maj_total"] = spend_dist["fec_disburse_democrat"] + spend_dist["fec_disburse_republican"]
-    spend_dist["fec_disburse_margin"] = (spend_dist["fec_disburse_republican"] - spend_dist["fec_disburse_democrat"]) / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
+    spend_dist["fec_disburse_margin"] = (
+        (spend_dist["fec_disburse_republican"] - spend_dist["fec_disburse_democrat"])
+        / spend_dist["fec_disburse_maj_total"].replace(0, np.nan)
+    )
 
-    spend_state = spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
-        ["fec_receipts_democrat","fec_receipts_republican","fec_receipts_all",
-         "fec_disburse_democrat","fec_disburse_republican","fec_disbursef
-isburse_all"]
-    ].sum().reset_index()
+    # State totals (sum across districts)
+    spend_state = (
+        spend_dist.groupby(["cycle_year", "state_po"], dropna=False)[
+            [
+                "fec_receipts_democrat", "fec_receipts_republican", "fec_receipts_all",
+                "fec_disburse_democrat", "fec_disburse_republican", "fec_disburse_all",
+            ]
+        ]
+        .sum()
+        .reset_index()
+    )
 
     spend_state["fec_receipts_maj_total"] = spend_state["fec_receipts_democrat"] + spend_state["fec_receipts_republican"]
-    spend_state["fec_receipts_margin"] = (spend_state["fec_receipts_republican"] - spend_state["fec_receipts_democrat"]) / spend_state["fec_receipts_maj_total"].replace(0, np.nan)
+    spend_state["fec_receipts_margin"] = (
+        (spend_state["fec_receipts_republican"] - spend_state["fec_receipts_democrat"])
+        / spend_state["fec_receipts_maj_total"].replace(0, np.nan)
+    )
+
     spend_state["fec_disburse_maj_total"] = spend_state["fec_disburse_democrat"] + spend_state["fec_disburse_republican"]
-    spend_state["fec_disburse_margin"] = (spend_state["fec_disburse_republican"] - spend_state["fec_disburse_democrat"]) / spend_state["fec_disburse_maj_total"].replace(0, np.nan)
+    spend_state["fec_disburse_margin"] = (
+        (spend_state["fec_disburse_republican"] - spend_state["fec_disburse_democrat"])
+        / spend_state["fec_disburse_maj_total"].replace(0, np.nan)
+    )
 
     return spend_dist, spend_state
+
 
 # ----------------------------
 # LOAD WAR (CSV)
